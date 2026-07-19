@@ -1,0 +1,92 @@
+name: build-release
+# bluelamp-installer(private) の main から BlueLampSetup.exe をビルドし、
+# このリポジトリの Release として公開する。
+# 恒久URL: https://github.com/yamatovision/bluelamp-download/releases/latest/download/BlueLampSetup.exe
+#
+# トリガー:
+#   - workflow_dispatch: 手動リリース（gh workflow run build-release -R yamatovision/bluelamp-download）
+#   - schedule: 毎日 06:17 JST に main の更新を検知し、未リリースの commit があれば自動リリース
+# 認証: read-only deploy key（installer リポの閲覧のみ・Secret INSTALLER_DEPLOY_KEY）。PAT 不使用。
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 21 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      sha7: ${{ steps.decide.outputs.sha7 }}
+      build_needed: ${{ steps.decide.outputs.build_needed }}
+    steps:
+      - name: Checkout installer main (read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: yamatovision/bluelamp-installer
+          ref: main
+          ssh-key: ${{ secrets.INSTALLER_DEPLOY_KEY }}
+      - name: Decide whether a build is needed
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHA7=$(git rev-parse --short=7 HEAD)
+          echo "sha7=$SHA7" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "build_needed=true" >> "$GITHUB_OUTPUT"
+            echo "manual dispatch -> build $SHA7"
+          elif gh api "repos/${{ github.repository }}/releases/tags/build-$SHA7" > /dev/null 2>&1; then
+            echo "build_needed=false" >> "$GITHUB_OUTPUT"
+            echo "release build-$SHA7 already exists -> skip"
+          else
+            echo "build_needed=true" >> "$GITHUB_OUTPUT"
+            echo "new commit $SHA7 -> build"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build_needed == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout installer main (read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: yamatovision/bluelamp-installer
+          ref: main
+          ssh-key: ${{ secrets.INSTALLER_DEPLOY_KEY }}
+      - name: Build BlueLampSetup.exe (Inno Setup)
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File build/build.ps1
+      - name: Generate SHA256SUMS.txt
+        shell: powershell
+        run: |
+          $hash = (Get-FileHash Output/BlueLampSetup.exe -Algorithm SHA256).Hash
+          "$hash  BlueLampSetup.exe" | Out-File -Encoding ascii Output/SHA256SUMS.txt
+          Get-Content Output/SHA256SUMS.txt
+      - name: Read AppVersion
+        id: ver
+        shell: powershell
+        run: |
+          $v = (Select-String -Path installer/BlueLampSetup.iss -Pattern '^AppVersion=(.+)$').Matches[0].Groups[1].Value.Trim()
+          "version=$v" | Out-File -Append -Encoding ascii $env:GITHUB_OUTPUT
+      - name: Publish release (latest)
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "build-${{ needs.check.outputs.sha7 }}"
+          gh release delete $tag --repo ${{ github.repository }} --cleanup-tag --yes 2>$null
+          gh release create $tag Output/BlueLampSetup.exe Output/SHA256SUMS.txt `
+            --repo ${{ github.repository }} `
+            --latest `
+            --title "BlueLampSetup v${{ steps.ver.outputs.version }} ($tag)" `
+            --notes "bluelamp-installer main @ ${{ needs.check.outputs.sha7 }} からの自動ビルド。SHA256 は SHA256SUMS.txt を参照。"
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }

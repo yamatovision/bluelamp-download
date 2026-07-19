@@ -63,22 +63,22 @@ jobs:
           ref: main
           ssh-key: ${{ secrets.INSTALLER_DEPLOY_KEY }}
       - name: Build BlueLampSetup.exe (Inno Setup)
-        shell: powershell
+        shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File build/build.ps1
       - name: Generate SHA256SUMS.txt
-        shell: powershell
+        shell: pwsh
         run: |
           $hash = (Get-FileHash Output/BlueLampSetup.exe -Algorithm SHA256).Hash
           "$hash  BlueLampSetup.exe" | Out-File -Encoding ascii Output/SHA256SUMS.txt
           Get-Content Output/SHA256SUMS.txt
       - name: Read AppVersion
         id: ver
-        shell: powershell
+        shell: pwsh
         run: |
           $v = (Select-String -Path installer/BlueLampSetup.iss -Pattern '^AppVersion=(.+)$').Matches[0].Groups[1].Value.Trim()
           "version=$v" | Out-File -Append -Encoding ascii $env:GITHUB_OUTPUT
       - name: Publish release (latest)
-        shell: powershell
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

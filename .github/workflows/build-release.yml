@@ -7,6 +7,9 @@ name: build-release
 #   - workflow_dispatch: 手動リリース（gh workflow run build-release -R yamatovision/bluelamp-download）
 #   - schedule: 毎日 06:17 JST に main の更新を検知し、未リリースの commit があれば自動リリース
 # 認証: read-only deploy key（installer リポの閲覧のみ・Secret INSTALLER_DEPLOY_KEY）。PAT 不使用。
+# コード署名: GlobalSign OV コードサイニング証明書（CN=MIKOTO, K.K.）。秘密鍵は GCP Cloud KMS の
+#   HSM（FIPS 140-2 Level 3）内にあり、エクスポート不可。CI は Workload Identity 連携で署名だけを依頼する。
+#   必要な Secret: GCP_WORKLOAD_IDENTITY_PROVIDER / GCP_SIGNING_SERVICE_ACCOUNT（詳細は codesign/README.md）
 
 on:
   workflow_dispatch:
@@ -15,6 +18,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write   # Google Cloud への Workload Identity 連携に必要（コード署名）
 
 concurrency:
   group: build-release
@@ -65,6 +69,62 @@ jobs:
       - name: Build BlueLampSetup.exe (Inno Setup)
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File build/build.ps1
+
+      # ---- ここからコード署名（GlobalSign OV / 秘密鍵は GCP Cloud KMS の HSM 内・外に出ない） ----
+      # ⚠️ 署名は必ず SHA256SUMS.txt の生成より前に行う。署名するとファイルのハッシュが変わるため。
+      - name: Checkout this repo (証明書チェーンの取得のみ)
+        uses: actions/checkout@v4
+        with:
+          path: _selfrepo
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SIGNING_SERVICE_ACCOUNT }}
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+      - name: Set up Java (jsign requires Java 11+)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Download jsign (pinned + checksum verified)
+        shell: pwsh
+        run: |
+          $url = 'https://github.com/ebourg/jsign/releases/download/7.5/jsign-7.5.jar'
+          $expected = '602A51C3545A6DC4FB99BD2EA7152B26D1345916D0C93DDFBD5936CB735AF91C'
+          Invoke-WebRequest -Uri $url -OutFile jsign.jar
+          $actual = (Get-FileHash jsign.jar -Algorithm SHA256).Hash
+          if ($actual -ne $expected) { throw "jsign.jar checksum mismatch: $actual" }
+      - name: Sign BlueLampSetup.exe (GlobalSign OV / Cloud KMS HSM)
+        shell: pwsh
+        run: |
+          $token = gcloud auth print-access-token
+          if (-not $token) { throw "failed to obtain GCP access token" }
+          java -jar jsign.jar `
+            --storetype GOOGLECLOUD `
+            --keystore projects/yamatovision-blue-lamp/locations/asia-northeast1/keyRings/bluelamp-codesign `
+            --storepass $token `
+            --alias ov-codesign-2026/cryptoKeyVersions/1 `
+            --certfile _selfrepo/codesign/full-chain.pem `
+            --tsaurl http://timestamp.globalsign.com/tsa/r6advanced1 `
+            --tsmode RFC3161 `
+            --alg SHA-256 `
+            --name "BlueLamp" `
+            --url "https://github.com/yamatovision/bluelamp-download" `
+            Output/BlueLampSetup.exe
+          if ($LASTEXITCODE -ne 0) { throw "jsign failed" }
+      - name: Verify signature (発行元が株式会社命であること)
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature Output/BlueLampSetup.exe
+          $sig | Format-List Status, StatusMessage, SignerCertificate, TimeStamperCertificate
+          if ($sig.Status -ne 'Valid') { throw "signature status is $($sig.Status)" }
+          if ($sig.SignerCertificate.Subject -notmatch 'MIKOTO') { throw "unexpected signer: $($sig.SignerCertificate.Subject)" }
+          if (-not $sig.TimeStamperCertificate) { throw "signature is not timestamped" }
+          "| 項目 | 値 |`n|---|---|`n| 署名 | $($sig.Status) |`n| 発行元 | $($sig.SignerCertificate.Subject) |`n| TSA | $($sig.TimeStamperCertificate.Subject) |" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+      # ---- コード署名ここまで ----
+
       - name: Generate SHA256SUMS.txt
         shell: pwsh
         run: |

@@ -18,6 +18,10 @@ on:
         description: 'Release を作らず、ビルド・署名・公証・検証だけ行う（PR 枝の試走用）'
         type: boolean
         default: false
+      installer_ref:
+        description: 'bluelamp-installer の ref。macOS ジョブにだけ効く。main 以外は dry_run=true のときだけ許す'
+        type: string
+        default: main
   schedule:
     - cron: '17 21 * * *'
 
@@ -69,11 +73,27 @@ jobs:
     if: needs.check.outputs.build_needed == 'true'
     runs-on: macos-latest
     steps:
-      - name: Checkout installer main (read-only deploy key)
+      # 🚨 installer_ref は「installer main へ入れる前に署名・公証・配布まで実証する」ための入口で、
+      #    **dry-run 専用**である。実 publish で main 以外の ref を受けると、任意の枝から作った
+      #    成果物を GA に載せられてしまう（供給網の穴）。⇒ ここで明示的に落とす。
+      #    schedule 経路は inputs が空なので既定の main のまま＝日次自動リリースの挙動は変わらない。
+      - name: installer_ref のガード（main 以外は dry-run のときだけ）
+        env:
+          INSTALLER_REF: ${{ inputs.installer_ref || 'main' }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -eu
+          echo "installer_ref=$INSTALLER_REF dry_run=$DRY_RUN"
+          if [ "$INSTALLER_REF" != "main" ] && [ "$DRY_RUN" != "true" ]; then
+            echo "::error::installer_ref に main 以外を渡せるのは dry_run=true のときだけです（実 publish は main からのみ）"
+            exit 1
+          fi
+
+      - name: Checkout installer (read-only deploy key)
         uses: actions/checkout@v4
         with:
           repository: yamatovision/bluelamp-installer
-          ref: main
+          ref: ${{ inputs.installer_ref || 'main' }}
           ssh-key: ${{ secrets.INSTALLER_DEPLOY_KEY }}
 
       # Xcode は pin しない。代わりに「どの Xcode で通っていたか」を必ず残す（installer 側 §M13）。

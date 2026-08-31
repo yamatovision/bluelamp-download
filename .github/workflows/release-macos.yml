@@ -9,9 +9,17 @@ name: release-macos
 #
 # ━━ なぜ build-release.yml に足さず、独立したファイルにしたか（CTO 条件 1 / 3 / 4）━━
 #  1. **条件 1（GA に触れない）**: 別ファイル・別タグ・`--prerelease` のみ。
-#     `--latest` はこのファイルに 1 度も現れない（`grep -c -- '--latest'` = 0 で実証できる）。
+#     ⚠️ 実証に素朴な `grep -c -- '--latest'` を使わないこと。**このファイルは注意書きと
+#        release notes 本文の中で `--latest` という語に言及している**ので grep は非 0 を返す。
+#        測るべきは「`gh release create` に渡る引数」であって語の出現数ではない:
+#          `git grep -n -- '--latest' -- .github/workflows/release-macos.yml`
+#        の全ヒットが「コメント」か「heredoc 内の notes 本文」であることを目で確かめる。
 #  2. **条件 3（Apple への提出を浪費しない）**: このファイルは **`schedule:` を持たない**。
-#     ⇒ cron から原理的に到達できない（`grep -c 'schedule' ` = 0 で実証できる）。
+#     ⇒ cron から原理的に到達できない。⚠️ ここも `grep -c 'schedule'` は非 0 になる
+#        （下の注意書きが `schedule:` に言及しているため）。**実証は on: を解析して測る**:
+#          python3 -c "import yaml,sys;d=yaml.safe_load(open(sys.argv[1]));\
+#            on=d[True] if True in d else d['on'];print(list(on.keys()))" \
+#            .github/workflows/release-macos.yml   # → ['workflow_dispatch']
 #     🚨 build-release.yml に mac ジョブを足す形だと、`cron '17 21 * * *'`（毎日 06:17 JST）で
 #        **毎朝 Apple へ notarytool submit が自動で飛ぶ**。さらに build-release.yml の
 #        `workflow_dispatch` は **windows の手動 GA リリースの入口**なので、CTO が GA を撃つたびに

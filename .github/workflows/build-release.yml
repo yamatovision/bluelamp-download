@@ -13,15 +13,6 @@ name: build-release
 
 on:
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: 'Release を作らず、ビルド・署名・公証・検証だけ行う（PR 枝の試走用）'
-        type: boolean
-        default: false
-      installer_ref:
-        description: 'bluelamp-installer の ref。macOS ジョブにだけ効く。main 以外は dry_run=true のときだけ許す'
-        type: string
-        default: main
   schedule:
     - cron: '17 21 * * *'
 
@@ -37,11 +28,6 @@ jobs:
   check:
     runs-on: ubuntu-latest
     outputs:
-      # 🚨 sha7 はタグ用の表示値。ビルドの取り出しには必ず sha（フル）を使うこと。
-      #    2026-08-30 に、ジョブごとに main を自分の実行時刻で引いていたため
-      #    check/build-macos は de3d812、build（Windows）は 0ae7e11 を掴んでいた
-      #    （run 33308043796 で実測）。タグが指す commit と中身の出所が食い違う。
-      sha: ${{ steps.decide.outputs.sha }}
       sha7: ${{ steps.decide.outputs.sha7 }}
       build_needed: ${{ steps.decide.outputs.build_needed }}
     steps:
@@ -56,11 +42,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          SHA=$(git rev-parse HEAD)
           SHA7=$(git rev-parse --short=7 HEAD)
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "sha7=$SHA7" >> "$GITHUB_OUTPUT"
-          echo "installer checkout SHA: $SHA"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "build_needed=true" >> "$GITHUB_OUTPUT"
             echo "manual dispatch -> build $SHA7"
@@ -72,150 +55,8 @@ jobs:
             echo "new commit $SHA7 -> build"
           fi
 
-  # ---- macOS: BlueLampSetup.dmg を署名・公証してビルドする（板 #529・installer 側 §M12） ----
-  # 🚨 このジョブが失敗すると windows の build ジョブごと走らないので、Release は作られない。
-  #    ＝「exe だけの新 latest」が出ず、前日の latest（と .dmg の恒久 URL）がそのまま残る。
-  # 署名鍵の secret はこのリポジトリにのみ登録する（installer リポには置かない・単一の源）。
-  build-macos:
-    needs: check
-    if: needs.check.outputs.build_needed == 'true'
-    runs-on: macos-latest
-    steps:
-      # 🚨 installer_ref は「installer main へ入れる前に署名・公証・配布まで実証する」ための入口で、
-      #    **dry-run 専用**である。実 publish で main 以外の ref を受けると、任意の枝から作った
-      #    成果物を GA に載せられてしまう（供給網の穴）。⇒ ここで明示的に落とす。
-      #    schedule 経路は inputs が空なので既定の main のまま＝日次自動リリースの挙動は変わらない。
-      - name: installer_ref のガード（main 以外は dry-run のときだけ）
-        env:
-          INSTALLER_REF: ${{ inputs.installer_ref || 'main' }}
-          DRY_RUN: ${{ inputs.dry_run }}
-        run: |
-          set -eu
-          echo "installer_ref=$INSTALLER_REF dry_run=$DRY_RUN"
-          if [ "$INSTALLER_REF" != "main" ] && [ "$DRY_RUN" != "true" ]; then
-            echo "::error::installer_ref に main 以外を渡せるのは dry_run=true のときだけです（実 publish は main からのみ）"
-            exit 1
-          fi
-
-      # 🚨 main を指すときは check が確定したフル SHA へ固定する（ジョブごとに main を
-      #    引き直すと、その間に main が動いた場合に別 commit を掴む）。installer_ref に
-      #    枝を渡す試走の入口は殺さない。schedule では inputs が空なので必ず SHA 側へ倒れる
-      #    ＝ if: の分岐に依存しない配線である。
-      - name: Checkout installer (read-only deploy key)
-        uses: actions/checkout@v4
-        with:
-          repository: yamatovision/bluelamp-installer
-          ref: ${{ (inputs.installer_ref == '' || inputs.installer_ref == 'main') && needs.check.outputs.sha || inputs.installer_ref }}
-          ssh-key: ${{ secrets.INSTALLER_DEPLOY_KEY }}
-      - name: installer の checkout SHA を記録
-        run: |
-          echo "installer checkout SHA: $(git rev-parse HEAD)"
-
-      # Xcode は pin しない。代わりに「どの Xcode で通っていたか」を必ず残す（installer 側 §M13）。
-      - name: Toolchain を記録
-        run: |
-          set -x
-          xcode-select -p
-          xcodebuild -version
-          swiftc --version
-          sw_vers
-
-      # 欠けていたら keychain を組む前にここで落とす（warn で素通りさせない）。
-      # 判定の実体は installer リポの build/mac/lib/signature-verdict.sh（値には触れない）。
-      - name: 署名・公証の secret がそろっているか
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: build/mac/require-signing-secrets.sh
-
-      - name: 一時 keychain に Developer ID を取り込む
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-        run: |
-          set -euo pipefail
-          keychain="$RUNNER_TEMP/bl-signing.keychain-db"
-          echo "BL_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
-          # 🚨 default-keychain -s を省くと find-identity が 0 件を返す（voicelamp の実測）
-          security default-keychain -s "$keychain"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
-          security set-keychain-settings -t 3600 -u "$keychain"
-          p12="$RUNNER_TEMP/developer-id.p12"
-          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$p12"
-          # ⚠️ ここで失敗しても「パスワード誤り」の顔をするが、OpenSSL 3.x 既定（PBES2）で作った
-          #    p12 だと同じ顔で落ちる。p12 は -legacy で作ること（installer 側 §7.3）。
-          if ! security import "$p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign; then
-            rm -f "$p12"
-            echo "::error::p12 の取り込みに失敗。パスワード誤りに見えても PBES2 の罠の可能性が高い。openssl pkcs12 -export -legacy -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 で作り直す（§7.3）"
-            exit 1
-          fi
-          rm -f "$p12"
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$keychain" >/dev/null
-          security find-identity -v -p codesigning "$keychain"
-
-      - name: Build / sign / notarize / staple BlueLampSetup.dmg
-        env:
-          BL_MACOS_NOTARIZATION: '1'
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        # 🚨 ここをパイプにしないこと。`build/build-mac.sh | tee ...` と書くと step の終了
-        #    ステータスが tee のものになり、署名が落ちても **ジョブが緑になる**（2026-08-30 に
-        #    実際に踏んだ: codesign が失敗し dmg が 0 バイトも出ていないのに build-macos は
-        #    success を返し、`build.needs: [check, build-macos]` のガードが機能しなかった）。
-        #    `set -o pipefail` を足す手もあるが、それは shell 設定に依存する。パイプ自体を
-        #    消すほうが強い（将来 `shell:` が変わっても壊れない）。
-        #    ログは後から cat して出すので、可視性は tee のときと変わらない。
-        run: |
-          status=0
-          build/build-mac.sh > "$RUNNER_TEMP/build-mac.log" 2>&1 || status=$?
-          cat "$RUNNER_TEMP/build-mac.log"
-          exit "$status"
-
-      # 受入 10 の証跡（stapler validate / spctl の二値出力）をそのまま残す。
-      - name: 署名・公証の二値判定を summary へ
-        if: always()
-        run: |
-          {
-            printf '### macOS 署名・公証の二値判定\n\n```\n'
-            tail -n 40 "$RUNNER_TEMP/build-mac.log" 2>/dev/null || echo '（ログなし＝ビルドが始まる前に落ちた）'
-            printf '```\n'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload BlueLampSetup.dmg
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-dmg
-          path: Output/BlueLampSetup.dmg
-          retention-days: 1
-          # 既定は warn。dmg が無いときに警告だけ出して緑で通り抜けるのを塞ぐ（§M12 条件 2）。
-          if-no-files-found: error
-
-      # voicelamp には cleanup が無い（使い捨てランナー前提）。self-hosted へ移したときに
-      # 鍵が残る事故を構造的に封じるため、ここでは必ず消す（多重防御・installer 側 §7.5）。
-      - name: 一時 keychain を必ず消す
-        if: always()
-        run: |
-          set -u
-          if [ -n "${BL_KEYCHAIN:-}" ] && [ -f "$BL_KEYCHAIN" ]; then
-            security default-keychain -s login.keychain-db
-            security delete-keychain "$BL_KEYCHAIN"
-            echo "deleted $BL_KEYCHAIN"
-          else
-            echo "一時 keychain は作られていない（消すものが無い）"
-          fi
-
   build:
-    needs: [check, build-macos]
+    needs: check
     if: needs.check.outputs.build_needed == 'true'
     runs-on: windows-latest
     steps:
@@ -223,14 +64,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: yamatovision/bluelamp-installer
-          # 🚨 ここを `main` に戻さないこと。macOS ジョブより後に走るので、その間に main が
-          #    動くと exe だけ別 commit から作られる（run 33308043796 で実測）。
-          ref: ${{ needs.check.outputs.sha }}
+          ref: main
           ssh-key: ${{ secrets.INSTALLER_DEPLOY_KEY }}
-      - name: installer の checkout SHA を記録
-        shell: pwsh
-        run: |
-          Write-Output "installer checkout SHA: $(git rev-parse HEAD)"
       - name: Build BlueLampSetup.exe (Inno Setup)
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File build/build.ps1
@@ -290,31 +125,12 @@ jobs:
           "| 項目 | 値 |`n|---|---|`n| 署名 | $($sig.Status) |`n| 発行元 | $($sig.SignerCertificate.Subject) |`n| TSA | $($sig.TimeStamperCertificate.Subject) |" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
       # ---- コード署名ここまで ----
 
-      # macOS ジョブが作った署名・公証済みの .dmg を持ち込む（板 #529）。
-      # このジョブは build-macos の成功を needs で待っているので、ここに .dmg が無いことは起きない。
-      - name: Download BlueLampSetup.dmg (macOS job)
-        uses: actions/download-artifact@v4
-        with:
-          name: macos-dmg
-          path: Output
-
       - name: Generate SHA256SUMS.txt
         shell: pwsh
         run: |
           $hash = (Get-FileHash Output/BlueLampSetup.exe -Algorithm SHA256).Hash
           "$hash  BlueLampSetup.exe" | Out-File -Encoding ascii Output/SHA256SUMS.txt
           Get-Content Output/SHA256SUMS.txt
-      # 1 リリース 3 アセット（exe / dmg / SHA256SUMS.txt）にするため、dmg の行を足す。
-      # ⚠️ 既存の生成 step は SHA256SUMS.txt を上書きするので、必ずその後で追記する。
-      - name: Append BlueLampSetup.dmg to SHA256SUMS.txt
-        shell: pwsh
-        run: |
-          if (-not (Test-Path Output/BlueLampSetup.dmg)) { throw "BlueLampSetup.dmg がない（macOS ジョブの artifact を確認）" }
-          if ((Get-Item Output/BlueLampSetup.dmg).Length -lt 1) { throw "BlueLampSetup.dmg が空" }
-          $hash = (Get-FileHash Output/BlueLampSetup.dmg -Algorithm SHA256).Hash
-          "$hash  BlueLampSetup.dmg" | Out-File -Append -Encoding ascii Output/SHA256SUMS.txt
-          Get-Content Output/SHA256SUMS.txt
-
       - name: Read AppVersion
         id: ver
         shell: pwsh
@@ -322,7 +138,6 @@ jobs:
           $v = (Select-String -Path installer/BlueLampSetup.iss -Pattern '^AppVersion=(.+)$').Matches[0].Groups[1].Value.Trim()
           "version=$v" | Out-File -Append -Encoding ascii $env:GITHUB_OUTPUT
       - name: Publish release (latest)
-        if: ${{ inputs.dry_run != true }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -335,43 +150,3 @@ jobs:
             --title "BlueLampSetup v${{ steps.ver.outputs.version }} ($tag)" `
             --notes "bluelamp-installer main @ ${{ needs.check.outputs.sha7 }} からの自動ビルド。SHA256 は SHA256SUMS.txt を参照。"
           if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
-
-      # .dmg を同じ Release に載せて 1 リリース 3 アセットにする。恒久 URL:
-      #   https://github.com/yamatovision/bluelamp-download/releases/latest/download/BlueLampSetup.dmg
-      - name: Attach BlueLampSetup.dmg to the release
-        if: ${{ inputs.dry_run != true }}
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $tag = "build-${{ needs.check.outputs.sha7 }}"
-          gh release upload $tag Output/BlueLampSetup.dmg --repo ${{ github.repository }} --clobber
-          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
-
-      # 「揃ったつもり」を潰す。0 件・欠落を合格にしない二値判定。
-      - name: Verify the release has all 3 assets
-        if: ${{ inputs.dry_run != true }}
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $tag = "build-${{ needs.check.outputs.sha7 }}"
-          $names = @(gh release view $tag --repo ${{ github.repository }} --json assets --jq '.assets[].name')
-          if ($LASTEXITCODE -ne 0) { throw "gh release view failed" }
-          if ($names.Count -lt 1) { throw "release $tag にアセットが 1 つも無い" }
-          $names
-          foreach ($want in @('BlueLampSetup.exe', 'BlueLampSetup.dmg', 'SHA256SUMS.txt')) {
-            if ($names -notcontains $want) { throw "release $tag に $want が無い（3 アセットが揃っていない）" }
-          }
-          "| 項目 | 値 |`n|---|---|`n| Release | $tag |`n| アセット | $($names -join ', ') |" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
-
-      # PR 枝の試走用。Release は作らず、3 アセットが揃うことだけを示す（§M12 条件 3）。
-      - name: Dry-run summary (Release は作らない)
-        if: ${{ inputs.dry_run == true }}
-        shell: pwsh
-        run: |
-          Get-ChildItem Output | Format-Table Name, Length
-          foreach ($want in @('BlueLampSetup.exe', 'BlueLampSetup.dmg', 'SHA256SUMS.txt')) {
-            if (-not (Test-Path "Output/$want")) { throw "$want がない（3 アセットが揃っていない）" }
-          }
-          "dry-run: exe / dmg / SHA256SUMS.txt の 3 アセットが揃っている。Release は作っていない。" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY

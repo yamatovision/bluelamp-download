@@ -1,0 +1,330 @@
+name: release-macos
+# 板 #529 便B-2a — bluelamp-installer(private) の main から BlueLampSetup.dmg をビルドし、
+# 署名・公証・staple して **pre-release として** 発行する。
+#
+# 🧬 出自: この workflow の中身（keychain / build / sign / notarize / staple / 後始末）は
+#    PR #2（枝 feat/macos-dmg-release・app レーン）の build-macos ジョブを土台にしている。
+#    実走 4 回（run 33307092062 / 33307656761 / 33308043796 / 33308511781）で罠 3 つを潰した
+#    成果をそのまま引き継ぐ。**本 workflow は PR #2 を supersede する。**
+#
+# ━━ なぜ build-release.yml に足さず、独立したファイルにしたか（CTO 条件 1 / 3 / 4）━━
+#  1. **条件 1（GA に触れない）**: 別ファイル・別タグ・`--prerelease` のみ。
+#     `--latest` はこのファイルに 1 度も現れない（`grep -c -- '--latest'` = 0 で実証できる）。
+#  2. **条件 3（Apple への提出を浪費しない）**: このファイルは **`schedule:` を持たない**。
+#     ⇒ cron から原理的に到達できない（`grep -c 'schedule' ` = 0 で実証できる）。
+#     🚨 build-release.yml に mac ジョブを足す形だと、`cron '17 21 * * *'`（毎日 06:17 JST）で
+#        **毎朝 Apple へ notarytool submit が自動で飛ぶ**。さらに build-release.yml の
+#        `workflow_dispatch` は **windows の手動 GA リリースの入口**なので、CTO が GA を撃つたびに
+#        mac の公証が巻き添えで飛ぶ。「提出を最小に」を人の運用に頼らず構造で守るため分離した。
+#  3. **条件 4（既存 job を 1 バイトも壊さない）**: build-release.yml を触らない。
+#     ⇒ `git diff --stat origin/main...HEAD -- .github/workflows/build-release.yml` が空になる。
+#
+# ⚠️ installer 側 §M12 は「配布リポの build-release.yml に macOS ジョブを追加し 1 リリース 3 アセット」
+#    と書いているが、**本便は CTO 条件 1（相乗り禁止）を守る時点で §M12 の「1 リリース 3 アセット」から
+#    既に外れている**。置き場所だけ §M12 に合わせても整合しない。§M12 の姿（同一タグ 3 アセット）への
+#    切り替えは **GA 昇格＝主君の号令＋CTO 手番**（板 #529 停止予定点②）。手順は PR body を参照。
+#
+# 🚨 タグ接頭辞を `build-` にしないこと。build-release.yml の check ジョブは
+#    `gh api repos/.../releases/tags/build-$SHA7` の **存在** で日次ビルドを skip する。
+#    `build-<sha7>` を名乗ると **windows の日次 GA を勝手に止める**＝GA フラグに触れたのと同じ。
+#    判定は .github/scripts/release-verdict.sh の bl_verdict_tag_prefix が構造的に弾く。
+#
+# 認証: read-only deploy key（installer リポの閲覧のみ・Secret INSTALLER_DEPLOY_KEY）。PAT 不使用。
+# 署名: Developer ID Application: MIKOTO, K.K. (6X8QVF7RM5)。証明書と Apple ID は GitHub Secret から
+#   環境変数として渡すだけで、**値は読まない・echo しない・ファイルへ平文で書かない**（条件 2）。
+#   必要な Secret 6 点は installer 側 build/mac/require-signing-secrets.sh が「在るか無いか」だけ検査する。
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'pre-release を作らず、ビルド・署名・公証・staple・検証だけ行う（installer 側 §M12 条件 3 の試走）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # pre-release の作成にだけ使う。id-token は要らない（あれは Windows の GCP 署名用）
+
+concurrency:
+  group: release-macos
+  cancel-in-progress: false
+
+jobs:
+  release-macos:
+    runs-on: macos-latest
+    steps:
+      # 🚨 installer を先に root へ、このリポを後から _selfrepo へ。
+      #    （root への checkout は作業ディレクトリを掃除するので、順序を入れ替えないこと）
+      - name: Checkout installer main (read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: yamatovision/bluelamp-installer
+          ref: main
+          ssh-key: ${{ secrets.INSTALLER_DEPLOY_KEY }}
+
+      - name: Checkout this repo (判定器の取得のみ)
+        uses: actions/checkout@v4
+        with:
+          path: _selfrepo
+
+      # 判定器が壊れていたら Apple に触る前にここで落とす（fail fast）。
+      - name: 判定器の単体テスト
+        run: sh _selfrepo/.github/scripts/tests/release-verdict.tests.sh
+
+      # 🚨 PR #2 が run 33308043796 で踏んだ罠: ジョブごとに main を自分の実行時刻で引くと、
+      #    check は de3d812、windows build は 0ae7e11 を掴み、**タグが指す commit と中身の出所が
+      #    食い違った**。本 workflow は **単一ジョブで checkout し、その SHA を自分のタグ名に使う**
+      #    ので、タグと中身は構造的に一致する（build-release.yml の check にも依存しない）。
+      - name: installer の SHA を確定し、タグ名を決める
+        run: |
+          set -euo pipefail
+          . "$GITHUB_WORKSPACE/_selfrepo/.github/scripts/release-verdict.sh"
+          sha=$(git rev-parse HEAD)
+          sha7=$(git rev-parse --short=7 HEAD)
+          tag="${BL_MAC_TAG_PREFIX}${sha7}"
+          if ! reason=$(bl_verdict_tag_prefix "$tag"); then
+            echo "::error::$reason"
+            exit 1
+          fi
+          echo "$reason"
+          echo "installer checkout SHA: $sha"
+          {
+            echo "BL_INSTALLER_SHA=$sha"
+            echo "BL_INSTALLER_SHA7=$sha7"
+            echo "BL_TAG=$tag"
+          } >> "$GITHUB_ENV"
+
+      # Xcode は pin しない。代わりに「どの Xcode で通っていたか」を必ず残す（installer 側 §M13）。
+      - name: Toolchain を記録
+        run: |
+          set -x
+          xcode-select -p
+          xcodebuild -version
+          swiftc --version
+          sw_vers
+
+      # 欠けていたら keychain を組む前にここで落とす（warn で素通りさせない）。
+      # 🚨 このスクリプトは「在るか無いか」しか見ず、値には触れない（条件 2）。
+      - name: 署名・公証の secret がそろっているか
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: build/mac/require-signing-secrets.sh
+
+      - name: 一時 keychain に Developer ID を取り込む
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/bl-signing.keychain-db"
+          echo "BL_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          # 🚨 default-keychain -s を省くと find-identity が 0 件を返す（voicelamp の実測）
+          security default-keychain -s "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -t 3600 -u "$keychain"
+          p12="$RUNNER_TEMP/developer-id.p12"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$p12"
+          # ⚠️ ここで失敗しても「パスワード誤り」の顔をするが、OpenSSL 3.x 既定（PBES2）で作った
+          #    p12 だと同じ顔で落ちる。p12 は -legacy で作ること（installer 側 §7.3）。
+          if ! security import "$p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign; then
+            rm -f "$p12"
+            echo "::error::p12 の取り込みに失敗。パスワード誤りに見えても PBES2 の罠の可能性が高い。openssl pkcs12 -export -legacy -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 で作り直す（§7.3）"
+            exit 1
+          fi
+          rm -f "$p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$keychain" >/dev/null
+          security find-identity -v -p codesigning "$keychain"
+
+      # 条件 1 の実証は「触っていないと言う」ではなく「前後で測る」。ここが前。
+      - name: GA（releases/latest）の現在地を記録
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          before=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name' 2>/dev/null) || before=''
+          [ -n "$before" ] || before='(none)'
+          echo "BL_GA_TAG_BEFORE=$before" >> "$GITHUB_ENV"
+          echo "publish 前の releases/latest = $before"
+
+      # 🚨 ここをパイプにしないこと。`build/build-mac.sh | tee ...` と書くと step の終了
+      #    ステータスが tee のものになり、署名が落ちても **ジョブが緑になる**（2026-08-30 に
+      #    PR #2 が実際に踏んだ: codesign が失敗し dmg が 0 バイトも出ていないのに build-macos は
+      #    success を返した）。`set -o pipefail` も併せて立てるが、**パイプ自体を消すほうが強い**
+      #    （将来 `shell:` が変わっても壊れない）。ログは後から cat して出すので可視性は同じ。
+      # 📌 PR #2 ではこの罠が `build.needs: [check, build-macos]` のガードを空振りさせた。
+      #    本 workflow は publish が **同じジョブの後段ステップ**なので、ここが落ちれば
+      #    publish には到達しない＝ジョブ間 needs ガードへの依存そのものが無い。
+      - name: Build / sign / notarize / staple BlueLampSetup.dmg
+        env:
+          BL_MACOS_NOTARIZATION: '1'
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -uo pipefail
+          status=0
+          build/build-mac.sh > "$RUNNER_TEMP/build-mac.log" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/build-mac.log"
+          exit "$status"
+
+      # installer 側 受入 10 の証跡（stapler validate / spctl の二値出力）をそのまま残す。
+      # 🚨 二値判定そのものは installer の build/mac/lib/signature-verdict.sh が持つ（単一の実装）。
+      #    配布リポ側への移植は便 B-2b の担当。ここでは実行結果を証跡として出すだけ。
+      - name: 署名・公証の二値判定を summary へ
+        if: always()
+        run: |
+          {
+            printf '### macOS 署名・公証の二値判定\n\n```\n'
+            tail -n 40 "$RUNNER_TEMP/build-mac.log" 2>/dev/null || echo '（ログなし＝ビルドが始まる前に落ちた）'
+            printf '```\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 「揃ったつもり」を潰す。0 バイト・不在を合格にしない。
+      - name: SHA256SUMS.txt を作る
+        run: |
+          set -euo pipefail
+          cd Output
+          if [ ! -s BlueLampSetup.dmg ]; then
+            echo '::error::BlueLampSetup.dmg が無いか 0 バイト（署名・公証が通っていない）'
+            exit 1
+          fi
+          # この SHA256SUMS.txt は **.dmg だけ** を対象とする（exe は windows の GA release 側にある）
+          shasum -a 256 BlueLampSetup.dmg > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload BlueLampSetup.dmg
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: |
+            Output/BlueLampSetup.dmg
+            Output/SHA256SUMS.txt
+          retention-days: 7
+          # 既定は warn。dmg が無いときに警告だけ出して緑で通り抜けるのを塞ぐ（§M12 条件 2 と同じ趣旨）。
+          if-no-files-found: error
+
+      # ⛔ ここに --latest を書かないこと。GA 昇格は主君の号令＋CTO 手番（板 #529 停止予定点②）。
+      - name: pre-release として発行
+        if: ${{ inputs.dry_run != true }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          . "$GITHUB_WORKSPACE/_selfrepo/.github/scripts/release-verdict.sh"
+          tag="$BL_TAG"
+          # 撃ち直しに備えて同名タグは作り直す。
+          # 🚨 消す前に必ず「pre-release であること」を確かめる。GA を消す事故を構造で塞ぐ。
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            pre=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq '.isPrerelease')
+            draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')
+            if ! reason=$(bl_verdict_prerelease "$pre" "$draft"); then
+              echo "::error::既存の $tag が pre-release でない。消さずに止める: $reason"
+              exit 1
+            fi
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          fi
+          # 複数行の notes は --notes-file で渡す（YAML のブロックスカラー内に
+          # 生の複数行文字列を書くとインデントが割れる）。
+          notes="$RUNNER_TEMP/release-notes.md"
+          cat > "$notes" <<NOTES
+          bluelamp-installer main @ ${BL_INSTALLER_SHA} からの署名・公証・staple 済みビルド（板 #529 便B-2a・run ${GITHUB_RUN_ID}）。
+
+          ⚠️ **これは pre-release であって GA ではない。** GA 昇格（\`--latest\` への flip）は主君の号令＋CTO 手番（板 #529 停止予定点②）。
+          ⚠️ **恒久 URL \`releases/latest/download/BlueLampSetup.dmg\` はこの状態では解決しない**（installer 側 §M9 は GA 昇格まで未達）。昇格時に CTO が同一タグ 3 アセット（§M12）へ切り替える必要がある。
+          ⚠️ この SHA256SUMS.txt は **.dmg のみ**を対象とする（BlueLampSetup.exe は windows 側の release にある）。
+          NOTES
+          gh release create "$tag" Output/BlueLampSetup.dmg Output/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --prerelease \
+            --title "【mac 専用・pre-release・GA しない】BlueLampSetup.dmg ($tag)" \
+            --notes-file "$notes"
+
+      # 条件 1 の実証。「触っていない」を宣言でなく実測で示す。
+      - name: GA 不変と pre-release であることを実測
+        if: ${{ inputs.dry_run != true }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          . "$GITHUB_WORKSPACE/_selfrepo/.github/scripts/release-verdict.sh"
+          tag="$BL_TAG"
+          after=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name' 2>/dev/null) || after=''
+          [ -n "$after" ] || after='(none)'
+
+          fails=0
+          judge() {
+            if reason=$("$@"); then
+              printf '  OK   %s\n' "$reason"
+            else
+              printf '  FAIL %s\n' "$reason"
+              fails=$((fails + 1))
+            fi
+          }
+          pre=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq '.isPrerelease')
+          draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')
+          names=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+
+          judge bl_verdict_ga_untouched "$BL_GA_TAG_BEFORE" "$after"
+          judge bl_verdict_prerelease "$pre" "$draft"
+          judge bl_verdict_release_assets "$names" BlueLampSetup.dmg SHA256SUMS.txt
+          judge bl_verdict_tag_prefix "$tag"
+
+          {
+            printf '### pre-release の発行結果\n\n| 項目 | 値 |\n|---|---|\n'
+            printf '| タグ | `%s` |\n' "$tag"
+            printf '| pre-release | %s |\n' "$pre"
+            printf '| draft | %s |\n' "$draft"
+            printf '| アセット | %s |\n' "$(printf '%s' "$names" | tr '\n' ' ')"
+            printf '| releases/latest（publish 前） | `%s` |\n' "$BL_GA_TAG_BEFORE"
+            printf '| releases/latest（publish 後） | `%s` |\n' "$after"
+            printf '| installer SHA | `%s` |\n' "$BL_INSTALLER_SHA"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$fails" -ne 0 ]; then
+            echo "::error::pre-release の検査で $fails 件が不合格"
+            exit 1
+          fi
+
+      # 試走用（installer 側 §M12 条件 3）。release は作らず、成果物が揃うことだけを示す。
+      - name: Dry-run summary (release は作らない)
+        if: ${{ inputs.dry_run == true }}
+        run: |
+          set -euo pipefail
+          ls -l Output
+          for want in BlueLampSetup.dmg SHA256SUMS.txt; do
+            [ -s "Output/$want" ] || { echo "::error::Output/$want が無いか 0 バイト"; exit 1; }
+          done
+          {
+            printf '### dry-run\n\n'
+            printf 'BlueLampSetup.dmg と SHA256SUMS.txt が揃っている。**release は作っていない**（タグ予定名 `%s`）。\n' "$BL_TAG"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # voicelamp には cleanup が無い（使い捨てランナー前提）。self-hosted へ移したときに
+      # 鍵が残る事故を構造的に封じるため、ここでは必ず消す（多重防御・installer 側 §7.5）。
+      - name: 一時 keychain を必ず消す
+        if: always()
+        run: |
+          set -u
+          # p12 は取り込み直後にも消しているが、途中で job が落ちた/中断された経路が残る。
+          # 使い捨てランナー前提でも、ここで必ずもう一度消す（多重防御）。
+          if [ -f "$RUNNER_TEMP/developer-id.p12" ]; then
+            rm -f "$RUNNER_TEMP/developer-id.p12"
+            echo "deleted leftover developer-id.p12"
+          fi
+          if [ -n "${BL_KEYCHAIN:-}" ] && [ -f "$BL_KEYCHAIN" ]; then
+            security default-keychain -s login.keychain-db
+            security delete-keychain "$BL_KEYCHAIN"
+            echo "deleted $BL_KEYCHAIN"
+          else
+            echo "一時 keychain は作られていない（消すものが無い）"
+          fi

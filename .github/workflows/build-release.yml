@@ -178,40 +178,52 @@ jobs:
 
       # 🚨 dmg はここで **既に署名・公証・staple 済みのもの**を取り込む（要件書 D2-6）。
       #    再署名も再パッケージもしない。hash は取り込んだファイルから採り直す（D2-5）。
-      # 🚨 取れなければ **赤で止める**。exe だけで release を作り直すのが dmg 消失そのものだった（D2-4）。
+      #
+      # 🚨 取れなくても **赤にしない**（PM 裁定 2026-09-07）。代わりに「揃わなければ GA を
+      #    作り直さない」へ倒す。⇒ 既存の GA release には 1 バイトも触れずに warning で終わる。
+      #    🔑 これで「dmg が黙って消える」は構造的に起きなくなる——**消す前に揃っていることが
+      #      条件**だからである（`gh release delete --cleanup-tag` は不可逆・fail-safe defaults）。
+      #    ⛔ 「exe だけで release を作り直す」ことはしない。それが消失そのものだった。
+      #    ⚠️ 同一 sha7 の `mac-<sha7>` を必須にはしない。`release-macos.yml` は
+      #      workflow_dispatch のみで日次 GA と歩調が合わず、**日次がほぼ常に赤になる**＝
+      #      誰も見なくなった赤が残る（PM 裁定）。exe と dmg が別 commit でありうることは
+      #      notes に両方の sha7 を別々に書いて明示する（⛔ 片方で両方を代表させない）。
       - name: mac の pre-release から BlueLampSetup.dmg を取り込む
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -uo pipefail
+          echo "BL_ASSETS_READY=0" >> "$GITHUB_ENV"
           mac_tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
             --json tagName,isPrerelease,createdAt \
             --jq '[.[] | select(.isPrerelease and (.tagName | startswith("mac-")))]
                   | sort_by(.createdAt) | reverse | .[0].tagName // ""')
           if [ -z "$mac_tag" ]; then
-            echo "::error::mac- で始まる pre-release が 1 つも無い。dmg を取り込めないので GA に触らずに止める（release-macos.yml を先に走らせること）"
-            exit 1
+            echo "::warning::mac- で始まる pre-release が 1 つも無い。dmg を取り込めないので GA を作り直さない（既存 GA はそのまま）"
+            exit 0
           fi
           echo "dmg の取り込み元: $mac_tag"
-          gh release download "$mac_tag" --repo "$GITHUB_REPOSITORY" \
-            --pattern BlueLampSetup.dmg --dir Output --clobber
-          if [ ! -s Output/BlueLampSetup.dmg ]; then
-            echo "::error::$mac_tag から取り込んだ BlueLampSetup.dmg が無いか 0 バイト。GA に触らずに止める"
-            exit 1
+          if ! gh release download "$mac_tag" --repo "$GITHUB_REPOSITORY" \
+              --pattern BlueLampSetup.dmg --dir Output --clobber; then
+            echo "::warning::$mac_tag から BlueLampSetup.dmg を取得できなかった。GA を作り直さない（既存 GA はそのまま）"
+            exit 0
           fi
-          # ⚠️ dmg は exe と別の installer commit から作られていることがある（release-macos.yml は
-          #    workflow_dispatch のみで、日次の GA と歩調が合わない）。**黙って混ぜない**——
-          #    どの pre-release から来たのかを notes に必ず書く。
-          mac_sha7=${mac_tag#mac-}
+          if [ ! -s Output/BlueLampSetup.dmg ]; then
+            echo "::warning::$mac_tag から取り込んだ BlueLampSetup.dmg が無いか 0 バイト。GA を作り直さない（既存 GA はそのまま）"
+            exit 0
+          fi
           {
             echo "BL_MAC_TAG=$mac_tag"
-            echo "BL_MAC_SHA7=$mac_sha7"
+            echo "BL_MAC_SHA7=${mac_tag#mac-}"
+            echo "BL_ASSETS_READY=1"
           } >> "$GITHUB_ENV"
           ls -l Output/BlueLampSetup.dmg
 
       # exe と dmg の 2 行。どちらの hash も **手元のファイルから採り直す**
       # （pre-release 側の SHA256SUMS.txt を写さない＝二重情報源にしない・D2-5）。
       - name: Generate SHA256SUMS.txt (exe と dmg の 2 行)
+        if: env.BL_ASSETS_READY == '1'
         shell: bash
         run: |
           cd Output
@@ -227,6 +239,7 @@ jobs:
 
       - name: Read AppVersion
         id: ver
+        if: env.BL_ASSETS_READY == '1'
         shell: pwsh
         run: |
           $v = (Select-String -Path installer/BlueLampSetup.iss -Pattern '^AppVersion=(.+)$').Matches[0].Groups[1].Value.Trim()
@@ -235,6 +248,7 @@ jobs:
       # 🚨 `gh release delete --cleanup-tag` は不可逆。**消す前に**3 点が揃っていることを確かめる
       #    （要件書 D2-4・fail-safe defaults）。ここが赤なら既存 GA は 1 バイトも動かない。
       - name: 3 アセットが揃っていることを delete の前に確かめる
+        if: env.BL_ASSETS_READY == '1'
         shell: bash
         run: |
           assets=$(cd Output && ls -1 BlueLampSetup.exe BlueLampSetup.dmg SHA256SUMS.txt 2>/dev/null || true)
@@ -246,6 +260,7 @@ jobs:
           echo "$reason"
 
       - name: Publish release (latest)
+        if: env.BL_ASSETS_READY == '1'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -254,10 +269,11 @@ jobs:
           tag="build-${BL_INSTALLER_SHA7}"
           notes="$RUNNER_TEMP/release-notes.md"
           cat > "$notes" <<NOTES
-          BlueLampSetup.exe: bluelamp-installer main @ ${BL_INSTALLER_SHA} からの署名済み自動ビルド（run ${GITHUB_RUN_ID}）。
-          BlueLampSetup.dmg: pre-release \`${BL_MAC_TAG}\`（installer @ ${BL_MAC_SHA7}）から取り込んだ署名・公証・staple 済みビルド。
+          BlueLampSetup.exe: bluelamp-installer @ **${BL_INSTALLER_SHA7}**（full \`${BL_INSTALLER_SHA}\`）からの署名済み自動ビルド（run ${GITHUB_RUN_ID}）。
+          BlueLampSetup.dmg: pre-release \`${BL_MAC_TAG}\` ＝ bluelamp-installer @ **${BL_MAC_SHA7}** から取り込んだ署名・公証・staple 済みビルド。
 
-          ⚠️ **exe と dmg は別の installer commit から作られていることがある。**上の 2 行がそれぞれの出所である。
+          ⚠️ **exe と dmg は別の installer commit から作られていることがある。**上の 2 行がそれぞれの出所であり、
+          ⛔ 片方の sha7 で両方を代表させていない（タグ名 \`build-<sha7>\` が指すのは **exe 側**の commit である）。
           SHA256 は SHA256SUMS.txt（exe と dmg の 2 行）を参照。hash はこの release に載っているファイルから採り直したもの。
           NOTES
           # 撃ち直しに備えて同名タグは作り直す。3 点が揃っていることは前の step で確認済み。
@@ -271,6 +287,7 @@ jobs:
 
       # 「出したつもり」を潰す。GitHub 側に実際に何が載ったかで測る（要件書 S2 の ✅）。
       - name: 出した release に 3 アセットが載っていることを実測
+        if: env.BL_ASSETS_READY == '1'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -296,3 +313,25 @@ jobs:
             echo "::error::releases/latest が '$latest' で、今出した '$tag' になっていない"
             exit 1
           fi
+
+      # 🚨 「何も起きなかった」を無音で終わらせない（潔癖性）。揃わなかったことと、
+      #    既存 GA に触れていないことを必ず残す。⛔ ここで release を作り直さない。
+      - name: 3 アセットが揃わなかったので GA を作り直していない
+        if: env.BL_ASSETS_READY != '1'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name' 2>/dev/null) || latest='(none)'
+          {
+            printf '### GA を作り直していない\n\n'
+            printf 'BlueLampSetup.dmg を取り込めなかったため、`gh release delete --cleanup-tag` も\n'
+            printf '`gh release create` も撃っていない。**既存の GA release は 1 バイトも動いていない。**\n\n'
+            printf '| 項目 | 値 |\n|---|---|\n'
+            printf '| exe をビルドした installer SHA | `%s` |\n' "$BL_INSTALLER_SHA"
+            printf '| releases/latest（変えていない） | `%s` |\n' "$latest"
+            printf '\n⛔ 「exe だけで作り直す」ことはしない（それが dmg 消失そのものだった）。\n'
+            printf 'dmg を出すには `release-macos.yml` を先に走らせること。\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::3 アセットが揃わなかったので GA を作り直していない（releases/latest = $latest のまま）"

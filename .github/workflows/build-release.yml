@@ -24,7 +24,11 @@ name: build-release
 #     次の実走 1 回で黙って消え、releases/latest/download/BlueLampSetup.dmg が 404 に戻った。
 #     ⇒ dmg を release-macos.yml が出した `mac-<sha7>` pre-release から取り込み、**3 点が揃って
 #        いることを確かめてから**でなければ既存 GA に触らない（`--cleanup-tag` は不可逆）。
-#        揃わないときの正しい振る舞いは「exe だけで作り直す」ではなく **赤で止めること**。
+#        揃わないときの正しい振る舞いは「exe だけで作り直す」ではなく **GA を作り直さないこと**。
+#        🚨 **赤で止めるのではない**（PM 裁定 2026-09-07）——`release-macos.yml` は
+#           workflow_dispatch のみで日次と歩調が合わず、赤にすると**日次がほぼ常に赤**になり
+#           「誰も見なくなった赤」が残る。⇒ warning ＋ no-op で終わり、既存 GA は 1 バイトも動かない。
+#           ⛔ この段落は実装と対で直すこと（前の版の「赤で止める」がヘッダにだけ残っていた）。
 
 on:
   workflow_dispatch:
@@ -193,12 +197,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # 🚨 `shell: bash` の既定は `bash --noprofile --norc -eo pipefail` で、ここに書く
+          #    `set -uo pipefail` は **`-e` を消さない**。⇒ 下のコマンド置換が失敗すると
+          #    step が **赤**になり、「dmg が取れなくても赤にしない」（PM 裁定）がこの経路だけ
+          #    通らなくなる。**失敗も明示的に warning ＋ exit 0 へ倒す**こと。
+          #    🔬 実測: bash --noprofile --norc -eo pipefail -c 'set -uo pipefail; x=$(false); echo reached'
+          #            → exit=1 で `reached` は出ない（`set +e` を書かない限り置換の失敗で即死する）。
           set -uo pipefail
           echo "BL_ASSETS_READY=0" >> "$GITHUB_ENV"
+          # ⛔ `set +e` で受けないこと（step の残り全部で -e が外れ、GITHUB_ENV への書き込み
+          #    失敗まで無音になる）。**この 1 コマンドだけ** `|| { … exit 0; }` で受ける。
           mac_tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
             --json tagName,isPrerelease,createdAt \
             --jq '[.[] | select(.isPrerelease and (.tagName | startswith("mac-")))]
-                  | sort_by(.createdAt) | reverse | .[0].tagName // ""')
+                  | sort_by(.createdAt) | reverse | .[0].tagName // ""') || {
+            echo "::warning::mac- の pre-release を一覧できなかった（GitHub API の一時障害等）。dmg を取り込めないので GA を作り直さない（既存 GA はそのまま）"
+            exit 0
+          }
           if [ -z "$mac_tag" ]; then
             echo "::warning::mac- で始まる pre-release が 1 つも無い。dmg を取り込めないので GA を作り直さない（既存 GA はそのまま）"
             exit 0

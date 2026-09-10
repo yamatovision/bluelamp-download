@@ -39,6 +39,12 @@ permissions:
   contents: write
   id-token: write   # Google Cloud への Workload Identity 連携に必要（コード署名）
 
+env:
+  # 取り込む dmg の鮮度の上限（日）。これを超えたら GA を作り直さない（赤にはしない）。
+  # 🚨 **この数値の正本はここ 1 箇所**（CTO 裁定 2026-09-10・案 A3 で 30 日）。判定器
+  #    .github/scripts/assert-dmg-freshness.sh には埋めていないので、変えるならここだけ直す。
+  BL_MAC_DMG_MAX_AGE_DAYS: '30'
+
 concurrency:
   group: build-release
   cancel-in-progress: false
@@ -107,6 +113,7 @@ jobs:
         run: |
           sh _selfrepo/.github/scripts/tests/assert-build-sha-matches.tests.sh
           sh _selfrepo/.github/scripts/tests/assert-release-assets.tests.sh
+          sh _selfrepo/.github/scripts/tests/assert-dmg-freshness.tests.sh
 
       # 「固定したから一致するはず」で済ませない（要件書 D2-2）。タグ・title・notes が
       # 名乗る SHA は、ここで採った **build の実 HEAD** から作る。
@@ -207,18 +214,40 @@ jobs:
           echo "BL_ASSETS_READY=0" >> "$GITHUB_ENV"
           # ⛔ `set +e` で受けないこと（step の残り全部で -e が外れ、GITHUB_ENV への書き込み
           #    失敗まで無音になる）。**この 1 コマンドだけ** `|| { … exit 0; }` で受ける。
-          mac_tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+          # 🚨 経過日数は **gh 同梱の jq（gojq）に計算させる**。⛔ `date -d` を使わないこと——
+          #    この step は windows ランナーの Git Bash で走り、GNU/BSD で `date` の書式が違う。
+          #    `now` と `fromdateiso8601` はどちらの機体でも同じ結果になる。
+          #    🔬 実測（2026-09-10・本番リポに対して読み取りのみ）: `mac-0ae7e11 9` を返した。
+          mac_meta=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
             --json tagName,isPrerelease,createdAt \
             --jq '[.[] | select(.isPrerelease and (.tagName | startswith("mac-")))]
-                  | sort_by(.createdAt) | reverse | .[0].tagName // ""') || {
+                  | sort_by(.createdAt) | reverse
+                  | if length == 0 then "" else
+                      (.[0] | "\(.tagName) \((now - (.createdAt | fromdateiso8601)) / 86400 | floor)")
+                    end') || {
             echo "::warning::mac- の pre-release を一覧できなかった（GitHub API の一時障害等）。dmg を取り込めないので GA を作り直さない（既存 GA はそのまま）"
+            echo "BL_NOT_READY_REASON=mac- の pre-release を一覧できなかった（GitHub API の一時障害等）" >> "$GITHUB_ENV"
             exit 0
           }
-          if [ -z "$mac_tag" ]; then
+          if [ -z "$mac_meta" ]; then
             echo "::warning::mac- で始まる pre-release が 1 つも無い。dmg を取り込めないので GA を作り直さない（既存 GA はそのまま）"
+            echo "BL_NOT_READY_REASON=mac- で始まる pre-release が 1 つも無い（release-macos.yml を先に走らせること）" >> "$GITHUB_ENV"
             exit 0
           fi
-          echo "dmg の取り込み元: $mac_tag"
+          mac_tag=${mac_meta%% *}
+          mac_age=${mac_meta##* }
+          echo "dmg の取り込み元: ${mac_tag}（${mac_age} 日前）"   # 🚨 $var の直後に全角文字を置かない（bash が変数名に取り込む）
+
+          # 🚨 鮮度ガード（CTO 裁定 2026-09-10・案 A3）。release-macos.yml は dispatch 専用で
+          #    日次と歩調が合わないため、**誰も撃たなければ同じ dmg が永遠に「最新」として GA に
+          #    載り続ける**（板 #707 の症状＝人手で載せた 1 本が正解であり続けた状態の再生産）。
+          #    ⇒ 古くなる方向にだけ歯止めを置く。⛔ ここも赤にはしない（no-op へ倒す）。
+          if ! reason=$(sh _selfrepo/.github/scripts/assert-dmg-freshness.sh "$mac_age" "$BL_MAC_DMG_MAX_AGE_DAYS"); then
+            echo "::warning::$reason"
+            echo "BL_NOT_READY_REASON=$reason" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "$reason"
           if ! gh release download "$mac_tag" --repo "$GITHUB_REPOSITORY" \
               --pattern BlueLampSetup.dmg --dir Output --clobber; then
             echo "::warning::$mac_tag から BlueLampSetup.dmg を取得できなかった。GA を作り直さない（既存 GA はそのまま）"
@@ -233,6 +262,16 @@ jobs:
             echo "BL_MAC_SHA7=${mac_tag#mac-}"
             echo "BL_ASSETS_READY=1"
           } >> "$GITHUB_ENV"
+          # ⚠️ exe と dmg が別の installer commit から作られていること自体は許す（PM 裁定＝
+          #    同一 sha7 必須にすると日次がほぼ常に赤になる）。⛔ ただし**黙って混ぜない**。
+          #    notes には既に両方の sha7 を別々に書いてあるが、ログと summary にも必ず残す。
+          if [ "${mac_tag#mac-}" != "$BL_INSTALLER_SHA7" ]; then
+            echo "::warning::exe と dmg の出所が違う: exe=$BL_INSTALLER_SHA7 / dmg=${mac_tag#mac-}（$mac_age 日前）。notes に両方を明記して出す"
+            printf '### exe と dmg の出所が違う\n\n| 成果物 | installer commit | 備考 |\n|---|---|---|\n| BlueLampSetup.exe | `%s` | この run でビルド |\n| BlueLampSetup.dmg | `%s` | `%s` から取り込み（%s 日前） |\n' \
+              "$BL_INSTALLER_SHA7" "${mac_tag#mac-}" "$mac_tag" "$mac_age" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "exe と dmg は同じ installer commit（${BL_INSTALLER_SHA7}）から出ている"
+          fi
           ls -l Output/BlueLampSetup.dmg
 
       # exe と dmg の 2 行。どちらの hash も **手元のファイルから採り直す**
@@ -344,6 +383,7 @@ jobs:
             printf 'BlueLampSetup.dmg を取り込めなかったため、`gh release delete --cleanup-tag` も\n'
             printf '`gh release create` も撃っていない。**既存の GA release は 1 バイトも動いていない。**\n\n'
             printf '| 項目 | 値 |\n|---|---|\n'
+            printf '| 揃わなかった理由 | %s |\n' "${BL_NOT_READY_REASON:-（理由が記録されていない＝取り込み step の想定外の経路）}"
             printf '| exe をビルドした installer SHA | `%s` |\n' "$BL_INSTALLER_SHA"
             printf '| releases/latest（変えていない） | `%s` |\n' "$latest"
             printf '\n⛔ 「exe だけで作り直す」ことはしない（それが dmg 消失そのものだった）。\n'

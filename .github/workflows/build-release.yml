@@ -114,6 +114,7 @@ jobs:
           sh _selfrepo/.github/scripts/tests/assert-build-sha-matches.tests.sh
           sh _selfrepo/.github/scripts/tests/assert-release-assets.tests.sh
           sh _selfrepo/.github/scripts/tests/assert-dmg-freshness.tests.sh
+          sh _selfrepo/.github/scripts/tests/select-mac-release.tests.sh
 
       # 「固定したから一致するはず」で済ませない（要件書 D2-2）。タグ・title・notes が
       # 名乗る SHA は、ここで採った **build の実 HEAD** から作る。
@@ -217,26 +218,43 @@ jobs:
           # 🚨 経過日数は **gh 同梱の jq（gojq）に計算させる**。⛔ `date -d` を使わないこと——
           #    この step は windows ランナーの Git Bash で走り、GNU/BSD で `date` の書式が違う。
           #    `now` と `fromdateiso8601` はどちらの機体でも同じ結果になる。
-          #    🔬 実測（2026-09-10・本番リポに対して読み取りのみ）: `mac-0ae7e11 9` を返した。
-          mac_meta=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
-            --json tagName,isPrerelease,createdAt \
+          #
+          # 🚨 使うのは **publishedAt**。⛔ `createdAt` を使うな——**GitHub の release の
+          #    `createdAt` は「タグが指す commit の日時」であって公開日時ではない**。
+          #    🔬 2026-09-10 の実配布事故: `mac-abd434b`（当日公開）と `mac-0ae7e11`（9 日前公開）が
+          #       **どちらも createdAt = 2026-08-31T12:22:55Z**（同じ commit を指すタグだから）で、
+          #       並べ替えが判別子にならず **9 日前のほうが GA に載った**。
+          #    ⛔ 経過日数を createdAt から出すと、**1 時間前に作った dmg も「9 日前」になる**
+          #       ＝鮮度ガードが dmg の年齢でなく commit の年齢を測る別物になる。
+          #
+          # 🚨 どれを選ぶかの判断は判定器に置く（テストできない場所に判断を置かない）。
+          #    ここは「候補と経過日数を測って渡す」だけ。⛔ 並び順に意味を持たせない。
+          mac_list=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json tagName,isPrerelease,publishedAt \
             --jq '[.[] | select(.isPrerelease and (.tagName | startswith("mac-")))]
-                  | sort_by(.createdAt) | reverse
-                  | if length == 0 then "" else
-                      (.[0] | "\(.tagName) \((now - (.createdAt | fromdateiso8601)) / 86400 | floor)")
-                    end') || {
+                  | map("\(.tagName) \((now - (.publishedAt | fromdateiso8601)) / 86400 | floor)")
+                  | join("\n")') || {
             echo "::warning::mac- の pre-release を一覧できなかった（GitHub API の一時障害等）。dmg を取り込めないので GA を作り直さない（既存 GA はそのまま）"
             echo "BL_NOT_READY_REASON=mac- の pre-release を一覧できなかった（GitHub API の一時障害等）" >> "$GITHUB_ENV"
             exit 0
           }
-          if [ -z "$mac_meta" ]; then
+          if [ -z "$mac_list" ]; then
             echo "::warning::mac- で始まる pre-release が 1 つも無い。dmg を取り込めないので GA を作り直さない（既存 GA はそのまま）"
             echo "BL_NOT_READY_REASON=mac- で始まる pre-release が 1 つも無い（release-macos.yml を先に走らせること）" >> "$GITHUB_ENV"
             exit 0
           fi
-          mac_tag=${mac_meta%% *}
-          mac_age=${mac_meta##* }
-          echo "dmg の取り込み元: ${mac_tag}（${mac_age} 日前）"   # 🚨 $var の直後に全角文字を置かない（bash が変数名に取り込む）
+          echo "候補:"
+          printf '%s\n' "$mac_list" | sed 's/^/  /'
+          if ! sel=$(sh _selfrepo/.github/scripts/select-mac-release.sh "$mac_list" "$BL_INSTALLER_SHA7"); then
+            echo "::warning::mac- の pre-release を選べなかった: ${sel}。GA を作り直さない（既存 GA はそのまま）"
+            echo "BL_NOT_READY_REASON=mac- の pre-release を選べなかった: ${sel}" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          mac_tag=${sel%% *}
+          mac_rest=${sel#* }
+          mac_age=${mac_rest%% *}
+          mac_why=${mac_rest##* }
+          echo "dmg の取り込み元: ${mac_tag}（${mac_age} 日前・選んだ理由 ${mac_why}）"   # 🚨 $var の直後に全角文字を置かない（bash が変数名に取り込む）
 
           # 🚨 鮮度ガード（CTO 裁定 2026-09-10・案 A3）。release-macos.yml は dispatch 専用で
           #    日次と歩調が合わないため、**誰も撃たなければ同じ dmg が永遠に「最新」として GA に

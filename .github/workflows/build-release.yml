@@ -2,6 +2,7 @@ name: build-release
 # bluelamp-installer(private) の main から BlueLampSetup.exe をビルドし、
 # このリポジトリの Release として公開する。
 # 恒久URL: https://github.com/yamatovision/bluelamp-download/releases/latest/download/BlueLampSetup.exe
+#          https://github.com/yamatovision/bluelamp-download/releases/latest/download/BlueLampSetup.dmg
 #
 # トリガー:
 #   - workflow_dispatch: 手動リリース（gh workflow run build-release -R yamatovision/bluelamp-download）
@@ -10,6 +11,24 @@ name: build-release
 # コード署名: GlobalSign OV コードサイニング証明書（CN=MIKOTO, K.K.）。秘密鍵は GCP Cloud KMS の
 #   HSM（FIPS 140-2 Level 3）内にあり、エクスポート不可。CI は Workload Identity 連携で署名だけを依頼する。
 #   必要な Secret: GCP_WORKLOAD_IDENTITY_PROVIDER / GCP_SIGNING_SERVICE_ACCOUNT（詳細は codesign/README.md）
+#
+# ━━ 板 #655（要件書 §3）で塞いだ 2 つの穴 ━━
+#  1. **出荷物と記録の食い違い**: check と build がそれぞれ独立に `ref: main` を引いていたため、
+#     間に installer へ push が入ると **別 commit の exe が check の sha7 を名乗るタグで出た**
+#     （run 33308043796 の実測: check/mac が de3d812・windows が 0ae7e11。両ジョブとも緑）。
+#     ⇒ check が **フル SHA** を output し、build の checkout をそれに固定する。さらに
+#        「固定したから一致するはず」で済ませず、build の実 HEAD と突き合わせて **実測で assert** する
+#        （.github/scripts/assert-build-sha-matches.sh）。
+#  2. **dmg の消失**: `gh release delete --cleanup-tag` の直後に exe と SUMS の **2 つだけ**を渡して
+#     release を作り直していたため、手作業で GA に載せた BlueLampSetup.dmg と SUMS の dmg 行が
+#     次の実走 1 回で黙って消え、releases/latest/download/BlueLampSetup.dmg が 404 に戻った。
+#     ⇒ dmg を release-macos.yml が出した `mac-<sha7>` pre-release から取り込み、**3 点が揃って
+#        いることを確かめてから**でなければ既存 GA に触らない（`--cleanup-tag` は不可逆）。
+#        揃わないときの正しい振る舞いは「exe だけで作り直す」ではなく **GA を作り直さないこと**。
+#        🚨 **赤で止めるのではない**（PM 裁定 2026-09-07）——`release-macos.yml` は
+#           workflow_dispatch のみで日次と歩調が合わず、赤にすると**日次がほぼ常に赤**になり
+#           「誰も見なくなった赤」が残る。⇒ warning ＋ no-op で終わり、既存 GA は 1 バイトも動かない。
+#           ⛔ この段落は実装と対で直すこと（前の版の「赤で止める」がヘッダにだけ残っていた）。
 
 on:
   workflow_dispatch:
@@ -20,6 +39,12 @@ permissions:
   contents: write
   id-token: write   # Google Cloud への Workload Identity 連携に必要（コード署名）
 
+env:
+  # 取り込む dmg の鮮度の上限（日）。これを超えたら GA を作り直さない（赤にはしない）。
+  # 🚨 **この数値の正本はここ 1 箇所**（CTO 裁定 2026-09-10・案 A3 で 30 日）。判定器
+  #    .github/scripts/assert-dmg-freshness.sh には埋めていないので、変えるならここだけ直す。
+  BL_MAC_DMG_MAX_AGE_DAYS: '30'
+
 concurrency:
   group: build-release
   cancel-in-progress: false
@@ -28,6 +53,9 @@ jobs:
   check:
     runs-on: ubuntu-latest
     outputs:
+      # 🚨 sha7 は表示用（タグ名・title）。**同一 commit の判定には使わない**——短縮 SHA の
+      #    一致は同一 commit の証明にならない。build の checkout に渡すのは必ず full の sha。
+      sha: ${{ steps.decide.outputs.sha }}
       sha7: ${{ steps.decide.outputs.sha7 }}
       build_needed: ${{ steps.decide.outputs.build_needed }}
     steps:
@@ -42,8 +70,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          SHA=$(git rev-parse HEAD)
           SHA7=$(git rev-parse --short=7 HEAD)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "sha7=$SHA7" >> "$GITHUB_OUTPUT"
+          echo "installer main = $SHA"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "build_needed=true" >> "$GITHUB_OUTPUT"
             echo "manual dispatch -> build $SHA7"
@@ -60,22 +91,53 @@ jobs:
     if: needs.check.outputs.build_needed == 'true'
     runs-on: windows-latest
     steps:
-      - name: Checkout installer main (read-only deploy key)
+      # 🚨 installer を先に root へ、このリポを後から _selfrepo へ。
+      #    （root への checkout は作業ディレクトリを掃除するので、順序を入れ替えないこと）
+      # 🚨 `ref: main` ではなく check が確定した **フル SHA** に固定する（要件書 D2-1）。
+      #    installer 側 §M12 条件1 の例外として CTO 裁定済み（5298d66）。
+      - name: Checkout installer at the SHA check decided (read-only deploy key)
         uses: actions/checkout@v4
         with:
           repository: yamatovision/bluelamp-installer
-          ref: main
+          ref: ${{ needs.check.outputs.sha }}
           ssh-key: ${{ secrets.INSTALLER_DEPLOY_KEY }}
+
+      - name: Checkout this repo (判定器と証明書チェーンの取得)
+        uses: actions/checkout@v4
+        with:
+          path: _selfrepo
+
+      # 判定器が壊れていたら、署名にも GA にも触る前にここで落とす（fail fast）。
+      - name: 判定器の単体テスト
+        shell: bash
+        run: |
+          sh _selfrepo/.github/scripts/tests/assert-build-sha-matches.tests.sh
+          sh _selfrepo/.github/scripts/tests/assert-release-assets.tests.sh
+          sh _selfrepo/.github/scripts/tests/assert-dmg-freshness.tests.sh
+
+      # 「固定したから一致するはず」で済ませない（要件書 D2-2）。タグ・title・notes が
+      # 名乗る SHA は、ここで採った **build の実 HEAD** から作る。
+      - name: 出荷物と記録の SHA が一致することを実測
+        shell: bash
+        run: |
+          sha=$(git rev-parse HEAD)
+          sha7=$(git rev-parse --short=7 HEAD)
+          if ! reason=$(sh _selfrepo/.github/scripts/assert-build-sha-matches.sh "${{ needs.check.outputs.sha }}" "$sha"); then
+            echo "::error::$reason"
+            exit 1
+          fi
+          echo "$reason"
+          {
+            echo "BL_INSTALLER_SHA=$sha"
+            echo "BL_INSTALLER_SHA7=$sha7"
+          } >> "$GITHUB_ENV"
+
       - name: Build BlueLampSetup.exe (Inno Setup)
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File build/build.ps1
 
       # ---- ここからコード署名（GlobalSign OV / 秘密鍵は GCP Cloud KMS の HSM 内・外に出ない） ----
       # ⚠️ 署名は必ず SHA256SUMS.txt の生成より前に行う。署名するとファイルのハッシュが変わるため。
-      - name: Checkout this repo (証明書チェーンの取得のみ)
-        uses: actions/checkout@v4
-        with:
-          path: _selfrepo
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
@@ -125,28 +187,206 @@ jobs:
           "| 項目 | 値 |`n|---|---|`n| 署名 | $($sig.Status) |`n| 発行元 | $($sig.SignerCertificate.Subject) |`n| TSA | $($sig.TimeStamperCertificate.Subject) |" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
       # ---- コード署名ここまで ----
 
-      - name: Generate SHA256SUMS.txt
-        shell: pwsh
+      # 🚨 dmg はここで **既に署名・公証・staple 済みのもの**を取り込む（要件書 D2-6）。
+      #    再署名も再パッケージもしない。hash は取り込んだファイルから採り直す（D2-5）。
+      #
+      # 🚨 取れなくても **赤にしない**（PM 裁定 2026-09-07）。代わりに「揃わなければ GA を
+      #    作り直さない」へ倒す。⇒ 既存の GA release には 1 バイトも触れずに warning で終わる。
+      #    🔑 これで「dmg が黙って消える」は構造的に起きなくなる——**消す前に揃っていることが
+      #      条件**だからである（`gh release delete --cleanup-tag` は不可逆・fail-safe defaults）。
+      #    ⛔ 「exe だけで release を作り直す」ことはしない。それが消失そのものだった。
+      #    ⚠️ 同一 sha7 の `mac-<sha7>` を必須にはしない。`release-macos.yml` は
+      #      workflow_dispatch のみで日次 GA と歩調が合わず、**日次がほぼ常に赤になる**＝
+      #      誰も見なくなった赤が残る（PM 裁定）。exe と dmg が別 commit でありうることは
+      #      notes に両方の sha7 を別々に書いて明示する（⛔ 片方で両方を代表させない）。
+      - name: mac の pre-release から BlueLampSetup.dmg を取り込む
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $hash = (Get-FileHash Output/BlueLampSetup.exe -Algorithm SHA256).Hash
-          "$hash  BlueLampSetup.exe" | Out-File -Encoding ascii Output/SHA256SUMS.txt
-          Get-Content Output/SHA256SUMS.txt
+          # 🚨 `shell: bash` の既定は `bash --noprofile --norc -eo pipefail` で、ここに書く
+          #    `set -uo pipefail` は **`-e` を消さない**。⇒ 下のコマンド置換が失敗すると
+          #    step が **赤**になり、「dmg が取れなくても赤にしない」（PM 裁定）がこの経路だけ
+          #    通らなくなる。**失敗も明示的に warning ＋ exit 0 へ倒す**こと。
+          #    🔬 実測: bash --noprofile --norc -eo pipefail -c 'set -uo pipefail; x=$(false); echo reached'
+          #            → exit=1 で `reached` は出ない（`set +e` を書かない限り置換の失敗で即死する）。
+          set -uo pipefail
+          echo "BL_ASSETS_READY=0" >> "$GITHUB_ENV"
+          # ⛔ `set +e` で受けないこと（step の残り全部で -e が外れ、GITHUB_ENV への書き込み
+          #    失敗まで無音になる）。**この 1 コマンドだけ** `|| { … exit 0; }` で受ける。
+          # 🚨 経過日数は **gh 同梱の jq（gojq）に計算させる**。⛔ `date -d` を使わないこと——
+          #    この step は windows ランナーの Git Bash で走り、GNU/BSD で `date` の書式が違う。
+          #    `now` と `fromdateiso8601` はどちらの機体でも同じ結果になる。
+          #    🔬 実測（2026-09-10・本番リポに対して読み取りのみ）: `mac-0ae7e11 9` を返した。
+          mac_meta=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json tagName,isPrerelease,createdAt \
+            --jq '[.[] | select(.isPrerelease and (.tagName | startswith("mac-")))]
+                  | sort_by(.createdAt) | reverse
+                  | if length == 0 then "" else
+                      (.[0] | "\(.tagName) \((now - (.createdAt | fromdateiso8601)) / 86400 | floor)")
+                    end') || {
+            echo "::warning::mac- の pre-release を一覧できなかった（GitHub API の一時障害等）。dmg を取り込めないので GA を作り直さない（既存 GA はそのまま）"
+            echo "BL_NOT_READY_REASON=mac- の pre-release を一覧できなかった（GitHub API の一時障害等）" >> "$GITHUB_ENV"
+            exit 0
+          }
+          if [ -z "$mac_meta" ]; then
+            echo "::warning::mac- で始まる pre-release が 1 つも無い。dmg を取り込めないので GA を作り直さない（既存 GA はそのまま）"
+            echo "BL_NOT_READY_REASON=mac- で始まる pre-release が 1 つも無い（release-macos.yml を先に走らせること）" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          mac_tag=${mac_meta%% *}
+          mac_age=${mac_meta##* }
+          echo "dmg の取り込み元: ${mac_tag}（${mac_age} 日前）"   # 🚨 $var の直後に全角文字を置かない（bash が変数名に取り込む）
+
+          # 🚨 鮮度ガード（CTO 裁定 2026-09-10・案 A3）。release-macos.yml は dispatch 専用で
+          #    日次と歩調が合わないため、**誰も撃たなければ同じ dmg が永遠に「最新」として GA に
+          #    載り続ける**（板 #707 の症状＝人手で載せた 1 本が正解であり続けた状態の再生産）。
+          #    ⇒ 古くなる方向にだけ歯止めを置く。⛔ ここも赤にはしない（no-op へ倒す）。
+          if ! reason=$(sh _selfrepo/.github/scripts/assert-dmg-freshness.sh "$mac_age" "$BL_MAC_DMG_MAX_AGE_DAYS"); then
+            echo "::warning::$reason"
+            echo "BL_NOT_READY_REASON=$reason" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "$reason"
+          if ! gh release download "$mac_tag" --repo "$GITHUB_REPOSITORY" \
+              --pattern BlueLampSetup.dmg --dir Output --clobber; then
+            echo "::warning::$mac_tag から BlueLampSetup.dmg を取得できなかった。GA を作り直さない（既存 GA はそのまま）"
+            exit 0
+          fi
+          if [ ! -s Output/BlueLampSetup.dmg ]; then
+            echo "::warning::$mac_tag から取り込んだ BlueLampSetup.dmg が無いか 0 バイト。GA を作り直さない（既存 GA はそのまま）"
+            exit 0
+          fi
+          {
+            echo "BL_MAC_TAG=$mac_tag"
+            echo "BL_MAC_SHA7=${mac_tag#mac-}"
+            echo "BL_ASSETS_READY=1"
+          } >> "$GITHUB_ENV"
+          # ⚠️ exe と dmg が別の installer commit から作られていること自体は許す（PM 裁定＝
+          #    同一 sha7 必須にすると日次がほぼ常に赤になる）。⛔ ただし**黙って混ぜない**。
+          #    notes には既に両方の sha7 を別々に書いてあるが、ログと summary にも必ず残す。
+          if [ "${mac_tag#mac-}" != "$BL_INSTALLER_SHA7" ]; then
+            echo "::warning::exe と dmg の出所が違う: exe=$BL_INSTALLER_SHA7 / dmg=${mac_tag#mac-}（$mac_age 日前）。notes に両方を明記して出す"
+            printf '### exe と dmg の出所が違う\n\n| 成果物 | installer commit | 備考 |\n|---|---|---|\n| BlueLampSetup.exe | `%s` | この run でビルド |\n| BlueLampSetup.dmg | `%s` | `%s` から取り込み（%s 日前） |\n' \
+              "$BL_INSTALLER_SHA7" "${mac_tag#mac-}" "$mac_tag" "$mac_age" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "exe と dmg は同じ installer commit（${BL_INSTALLER_SHA7}）から出ている"
+          fi
+          ls -l Output/BlueLampSetup.dmg
+
+      # exe と dmg の 2 行。どちらの hash も **手元のファイルから採り直す**
+      # （pre-release 側の SHA256SUMS.txt を写さない＝二重情報源にしない・D2-5）。
+      - name: Generate SHA256SUMS.txt (exe と dmg の 2 行)
+        if: env.BL_ASSETS_READY == '1'
+        shell: bash
+        run: |
+          cd Output
+          for f in BlueLampSetup.exe BlueLampSetup.dmg; do
+            [ -s "$f" ] || { echo "::error::Output/$f が無いか 0 バイト"; exit 1; }
+          done
+          : > SHA256SUMS.txt
+          for f in BlueLampSetup.exe BlueLampSetup.dmg; do
+            h=$(sha256sum "$f" | cut -d' ' -f1)
+            printf '%s  %s\n' "$h" "$f" >> SHA256SUMS.txt
+          done
+          cat SHA256SUMS.txt
+
       - name: Read AppVersion
         id: ver
+        if: env.BL_ASSETS_READY == '1'
         shell: pwsh
         run: |
           $v = (Select-String -Path installer/BlueLampSetup.iss -Pattern '^AppVersion=(.+)$').Matches[0].Groups[1].Value.Trim()
           "version=$v" | Out-File -Append -Encoding ascii $env:GITHUB_OUTPUT
+
+      # 🚨 `gh release delete --cleanup-tag` は不可逆。**消す前に**3 点が揃っていることを確かめる
+      #    （要件書 D2-4・fail-safe defaults）。ここが赤なら既存 GA は 1 バイトも動かない。
+      - name: 3 アセットが揃っていることを delete の前に確かめる
+        if: env.BL_ASSETS_READY == '1'
+        shell: bash
+        run: |
+          assets=$(cd Output && ls -1 BlueLampSetup.exe BlueLampSetup.dmg SHA256SUMS.txt 2>/dev/null || true)
+          sums=$(cat Output/SHA256SUMS.txt 2>/dev/null || true)
+          if ! reason=$(sh _selfrepo/.github/scripts/assert-release-assets.sh "$assets" "$sums"); then
+            echo "::error::$reason"
+            exit 1
+          fi
+          echo "$reason"
+
       - name: Publish release (latest)
-        shell: pwsh
+        if: env.BL_ASSETS_READY == '1'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BL_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          tag="build-${BL_INSTALLER_SHA7}"
+          notes="$RUNNER_TEMP/release-notes.md"
+          cat > "$notes" <<NOTES
+          BlueLampSetup.exe: bluelamp-installer @ **${BL_INSTALLER_SHA7}**（full \`${BL_INSTALLER_SHA}\`）からの署名済み自動ビルド（run ${GITHUB_RUN_ID}）。
+          BlueLampSetup.dmg: pre-release \`${BL_MAC_TAG}\` ＝ bluelamp-installer @ **${BL_MAC_SHA7}** から取り込んだ署名・公証・staple 済みビルド。
+
+          ⚠️ **exe と dmg は別の installer commit から作られていることがある。**上の 2 行がそれぞれの出所であり、
+          ⛔ 片方の sha7 で両方を代表させていない（タグ名 \`build-<sha7>\` が指すのは **exe 側**の commit である）。
+          SHA256 は SHA256SUMS.txt（exe と dmg の 2 行）を参照。hash はこの release に載っているファイルから採り直したもの。
+          NOTES
+          # 撃ち直しに備えて同名タグは作り直す。3 点が揃っていることは前の step で確認済み。
+          gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes 2>/dev/null || true
+          gh release create "$tag" \
+            Output/BlueLampSetup.exe Output/BlueLampSetup.dmg Output/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --latest \
+            --title "BlueLampSetup v${BL_VERSION} ($tag)" \
+            --notes-file "$notes"
+
+      # 「出したつもり」を潰す。GitHub 側に実際に何が載ったかで測る（要件書 S2 の ✅）。
+      - name: 出した release に 3 アセットが載っていることを実測
+        if: env.BL_ASSETS_READY == '1'
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "build-${{ needs.check.outputs.sha7 }}"
-          gh release delete $tag --repo ${{ github.repository }} --cleanup-tag --yes 2>$null
-          gh release create $tag Output/BlueLampSetup.exe Output/SHA256SUMS.txt `
-            --repo ${{ github.repository }} `
-            --latest `
-            --title "BlueLampSetup v${{ steps.ver.outputs.version }} ($tag)" `
-            --notes "bluelamp-installer main @ ${{ needs.check.outputs.sha7 }} からの自動ビルド。SHA256 は SHA256SUMS.txt を参照。"
-          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+          tag="build-${BL_INSTALLER_SHA7}"
+          names=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          sums=$(cat Output/SHA256SUMS.txt)
+          if ! reason=$(sh _selfrepo/.github/scripts/assert-release-assets.sh "$names" "$sums"); then
+            echo "::error::$reason"
+            exit 1
+          fi
+          echo "$reason"
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')
+          {
+            printf '### GA release の発行結果\n\n| 項目 | 値 |\n|---|---|\n'
+            printf '| タグ | `%s` |\n' "$tag"
+            printf '| installer SHA（exe の出所） | `%s` |\n' "$BL_INSTALLER_SHA"
+            printf '| dmg の取り込み元 | `%s` |\n' "$BL_MAC_TAG"
+            printf '| アセット | %s |\n' "$(printf '%s' "$names" | tr '\n' ' ')"
+            printf '| releases/latest | `%s` |\n' "$latest"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$latest" != "$tag" ]; then
+            echo "::error::releases/latest が '$latest' で、今出した '$tag' になっていない"
+            exit 1
+          fi
+
+      # 🚨 「何も起きなかった」を無音で終わらせない（潔癖性）。揃わなかったことと、
+      #    既存 GA に触れていないことを必ず残す。⛔ ここで release を作り直さない。
+      - name: 3 アセットが揃わなかったので GA を作り直していない
+        if: env.BL_ASSETS_READY != '1'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name' 2>/dev/null) || latest='(none)'
+          {
+            printf '### GA を作り直していない\n\n'
+            printf 'BlueLampSetup.dmg を取り込めなかったため、`gh release delete --cleanup-tag` も\n'
+            printf '`gh release create` も撃っていない。**既存の GA release は 1 バイトも動いていない。**\n\n'
+            printf '| 項目 | 値 |\n|---|---|\n'
+            printf '| 揃わなかった理由 | %s |\n' "${BL_NOT_READY_REASON:-（理由が記録されていない＝取り込み step の想定外の経路）}"
+            printf '| exe をビルドした installer SHA | `%s` |\n' "$BL_INSTALLER_SHA"
+            printf '| releases/latest（変えていない） | `%s` |\n' "$latest"
+            printf '\n⛔ 「exe だけで作り直す」ことはしない（それが dmg 消失そのものだった）。\n'
+            printf 'dmg を出すには `release-macos.yml` を先に走らせること。\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::3 アセットが揃わなかったので GA を作り直していない（releases/latest = $latest のまま）"

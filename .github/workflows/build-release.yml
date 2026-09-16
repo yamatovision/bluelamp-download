@@ -7,6 +7,7 @@ name: build-release
 # トリガー:
 #   - workflow_dispatch: 手動リリース（gh workflow run build-release -R yamatovision/bluelamp-download）
 #   - schedule: 毎日 06:17 JST に main の更新を検知し、未リリースの commit があれば自動リリース
+#     ただし前回 GA からの変更が文書だけ（docs/ 配下・リポ直下の *.md）なら warning で skip（板 #936）
 # 認証: read-only deploy key（installer リポの閲覧のみ・Secret INSTALLER_DEPLOY_KEY）。PAT 不使用。
 # コード署名: GlobalSign OV コードサイニング証明書（CN=MIKOTO, K.K.）。秘密鍵は GCP Cloud KMS の
 #   HSM（FIPS 140-2 Level 3）内にあり、エクスポート不可。CI は Workload Identity 連携で署名だけを依頼する。
@@ -65,6 +66,15 @@ jobs:
           repository: yamatovision/bluelamp-installer
           ref: main
           ssh-key: ${{ secrets.INSTALLER_DEPLOY_KEY }}
+          # 前回 GA の commit との差分を採るため全履歴を取る（docs-only skip・板 #936）
+          fetch-depth: 0
+      # 🚨 installer を先に root へ、このリポを後から _selfrepo へ（build job と同じ順序）。
+      - name: Checkout this repo (判定器の取得)
+        uses: actions/checkout@v4
+        with:
+          path: _selfrepo
+      - name: 判定器の単体テスト（docs-only）
+        run: sh _selfrepo/.github/scripts/tests/is-docs-only.tests.sh
       - name: Decide whether a build is needed
         id: decide
         env:
@@ -82,6 +92,39 @@ jobs:
             echo "build_needed=false" >> "$GITHUB_OUTPUT"
             echo "release build-$SHA7 already exists -> skip"
           else
+            # ━━ docs-only skip（板 #936 系統⑤(b)・大掃除便 2026-09-17）━━
+            # 前回 GA（releases/latest＝build-<sha7>）の commit から今の main までの変更が
+            # 文書だけなら、GA を作り直さない（exe 再署名・GA の一時消失・指紋の変更を docs で起こさない）。
+            # ⇒ これまで人が `build-<sha7>` の placeholder release を前置して止めていた経路を不要にする。
+            # 🚨 判定できないとき（latest が build-* でない・sha7 が解決できない・祖先でない・diff 失敗）は
+            #    **これまでどおりビルドする**（fail-safe: 出荷すべき変更を黙って止めない）。⛔ 赤にしない。
+            # 🚨 schedule だけに効く。workflow_dispatch は上で無条件 build（手動は人の判断を優先）。
+            # 「文書」の定義は判定器 .github/scripts/is-docs-only.sh に置く（⛔ ここに条件を書かない）。
+            latest=$(gh api "repos/${{ github.repository }}/releases/latest" --jq '.tag_name' 2>/dev/null) || latest=''
+            base=''
+            case "$latest" in
+              build-*) base=$(git rev-parse --verify --quiet "${latest#build-}^{commit}") || base='' ;;
+            esac
+            verdict=''
+            if [ -n "$base" ] && git merge-base --is-ancestor "$base" "$SHA" \
+                && changed=$(git -c core.quotepath=false diff --name-only --no-renames "$base" "$SHA"); then
+              if verdict=$(sh _selfrepo/.github/scripts/is-docs-only.sh "$changed"); then
+                echo "build_needed=false" >> "$GITHUB_OUTPUT"
+                echo "::warning::docs-only skip: 前回 GA ${latest} から ${SHA7} までの変更は文書だけ → GA を作り直さない（${verdict}）"
+                {
+                  printf '### docs-only skip（GA を作り直していない）\n\n'
+                  printf '| 項目 | 値 |\n|---|---|\n'
+                  printf '| 前回 GA | `%s`（`%s`） |\n' "$latest" "$base"
+                  printf '| installer main | `%s` |\n' "$SHA"
+                  printf '| 判定 | %s |\n' "$verdict"
+                  printf '\n変更パス:\n\n```\n%s\n```\n' "$changed"
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              echo "docs-only ではない: $verdict"
+            else
+              echo "docs-only を判定できない（latest='${latest}' base='${base}'）→ これまでどおりビルド"
+            fi
             echo "build_needed=true" >> "$GITHUB_OUTPUT"
             echo "new commit $SHA7 -> build"
           fi

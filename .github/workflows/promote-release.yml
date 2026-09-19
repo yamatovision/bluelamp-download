@@ -1,0 +1,92 @@
+name: promote-release
+# 検証した pre-release（build-<sha7>）を GA（releases/latest）に昇格する。**GA を作る経路はこれ 1 本だけ**。
+# （板 #936 系統⑤③・n=1805・CTO68 裁定 A）
+#
+# 🔑 なぜ在るか: build-release.yml の既定は以前「自動で GA」で、止めるには人が空の placeholder を先に置く必要があった
+#    ＝人が覚えていないと安全にならない形。いまは build-release.yml は pre-release しか作らず、
+#    GA は「検証した sha をこの dispatch で昇格させる」という意図的な 1 手になった。⛔ placeholder は要らない。
+#
+# 使い方（検証してから撃つ）:
+#   gh workflow run promote-release -R yamatovision/bluelamp-download -f tag=build-<sha7>
+#
+# 🚨 schedule・push・pull_request では絶対に走らせない（ガード: .github/scripts/tests/workflow-guards.tests.sh）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '昇格させる pre-release のタグ（build-<sha7>）。検証済みの物だけを指定する'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-release   # build-release.yml と同じ group＝ビルド中に昇格させない
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Checkout this repo（判定器）
+        uses: actions/checkout@v4
+
+      - name: 判定器の単体テスト
+        run: |
+          sh .github/scripts/tests/assert-promotable.tests.sh
+          sh .github/scripts/tests/assert-release-assets.tests.sh
+          sh .github/scripts/tests/workflow-guards.tests.sh
+
+      - name: 昇格してよいかを測る（形・pre-release であること）
+        run: |
+          set -u
+          pre=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq '.isPrerelease' 2>/dev/null || echo unknown)
+          if ! reason=$(sh .github/scripts/assert-promotable.sh "$TAG" "$pre"); then
+            echo "::error::$reason"
+            exit 1
+          fi
+          echo "$reason"
+
+      # 「載っているはず」で済ませない。実物を落として SUMS と突き合わせる（hash は載っているファイルから採る）。
+      - name: 3 アセットを落として SHA256SUMS と一致することを実測
+        run: |
+          set -eu
+          mkdir -p dl
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dl \
+            --pattern BlueLampSetup.exe --pattern BlueLampSetup.dmg --pattern SHA256SUMS.txt
+          names=$(cd dl && ls -1)
+          sums=$(cat dl/SHA256SUMS.txt)
+          if ! reason=$(sh .github/scripts/assert-release-assets.sh "$names" "$sums"); then
+            echo "::error::$reason"
+            exit 1
+          fi
+          echo "$reason"
+          (cd dl && sha256sum -c SHA256SUMS.txt)
+
+      - name: GA に昇格する
+        run: |
+          set -eu
+          before=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name' 2>/dev/null || echo '(none)')
+          echo "BEFORE=$before" >> "$GITHUB_ENV"
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease=false --latest
+
+      - name: releases/latest が昇格した物になったことを実測
+        run: |
+          set -eu
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')
+          pre=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq '.isPrerelease')
+          {
+            printf '### GA への昇格\n\n| 項目 | 値 |\n|---|---|\n'
+            printf '| 昇格したタグ | `%s` |\n' "$TAG"
+            printf '| releases/latest（前 → 後） | `%s` → `%s` |\n' "$BEFORE" "$latest"
+            printf '| isPrerelease | `%s` |\n' "$pre"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$latest" != "$TAG" ] || [ "$pre" != "false" ]; then
+            echo "::error::昇格できていない（latest=$latest isPrerelease=$pre）"
+            exit 1
+          fi

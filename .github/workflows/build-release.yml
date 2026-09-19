@@ -6,8 +6,17 @@ name: build-release
 #
 # トリガー:
 #   - workflow_dispatch: 手動リリース（gh workflow run build-release -R yamatovision/bluelamp-download）
-#   - schedule: 毎日 06:17 JST に main の更新を検知し、未リリースの commit があれば自動リリース
-#     ただし前回 GA からの変更が文書だけ（docs/ 配下・リポ直下の *.md）なら warning で skip（板 #936）
+#   - schedule: 毎日 06:17 JST（🪤 実際の発火は 1.5〜2 時間遅れる）に main の更新を検知し、未リリースの commit があれば
+#     **pre-release**（build-<sha7>・Latest にしない）を作る。ただし前回 GA からの変更が文書だけ
+#     （docs/ 配下・リポ直下の *.md）なら warning で skip（板 #936）
+#
+# ━━ GA は promote-release.yml の dispatch でしか作らない（板 #936 系統⑤③・n=1805・CTO68 裁定 A）━━
+#   このワークフローは GA（releases/latest）を 1 バイトも動かさない。検証した sha を
+#   `gh workflow run promote-release -R yamatovision/bluelamp-download -f tag=build-<sha7>` で昇格させる。
+#   🔑 以前は既定が自動 GA で、止めるには人が空の placeholder release（build-<sha7>）を先に置く必要があった
+#      ＝人が覚えていないと安全にならない形。2026-09-18 に誰も置かず、installer のコード 2 commit が
+#      21:26Z に自動で GA（build-1d3c7a0）になった。⇒ 既定を pre-release にして「覚えている必要」を消した。
+#   ⛔ placeholder を置く手順はもう要らない。ガード: .github/scripts/tests/workflow-guards.tests.sh
 # 認証: read-only deploy key（installer リポの閲覧のみ・Secret INSTALLER_DEPLOY_KEY）。PAT 不使用。
 # コード署名: GlobalSign OV コードサイニング証明書（CN=MIKOTO, K.K.）。秘密鍵は GCP Cloud KMS の
 #   HSM（FIPS 140-2 Level 3）内にあり、エクスポート不可。CI は Workload Identity 連携で署名だけを依頼する。
@@ -158,6 +167,7 @@ jobs:
           sh _selfrepo/.github/scripts/tests/assert-release-assets.tests.sh
           sh _selfrepo/.github/scripts/tests/assert-dmg-freshness.tests.sh
           sh _selfrepo/.github/scripts/tests/select-mac-release.tests.sh
+          sh _selfrepo/.github/scripts/tests/workflow-guards.tests.sh
 
       # 「固定したから一致するはず」で済ませない（要件書 D2-2）。タグ・title・notes が
       # 名乗る SHA は、ここで採った **build の実 HEAD** から作る。
@@ -374,7 +384,7 @@ jobs:
           fi
           echo "$reason"
 
-      - name: Publish release (latest)
+      - name: Publish pre-release（Latest にしない・GA は promote-release.yml でだけ作る）
         if: env.BL_ASSETS_READY == '1'
         shell: bash
         env:
@@ -391,18 +401,30 @@ jobs:
           ⛔ 片方の sha7 で両方を代表させていない（タグ名 \`build-<sha7>\` が指すのは **exe 側**の commit である）。
           SHA256 は SHA256SUMS.txt（exe と dmg の 2 行）を参照。hash はこの release に載っているファイルから採り直したもの。
           NOTES
-          # 撃ち直しに備えて同名タグは作り直す。3 点が揃っていることは前の step で確認済み。
-          gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes 2>/dev/null || true
+          # 🚨 同名タグが既に **GA** なら触らない（撃ち直しで GA を消さない）。GA の作り直しは
+          #    promote-release.yml の経路でだけ行う。pre-release なら撃ち直しに備えて作り直す。
+          existing=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq '.isPrerelease' 2>/dev/null || echo none)
+          if [ "$existing" = "false" ]; then
+            echo "::warning::$tag は既に GA。このワークフローは GA に触らないので作り直さない"
+            printf '### %s は既に GA のため作り直していない\n' "$tag" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name' > "$RUNNER_TEMP/latest-before.txt" 2>/dev/null || echo '(none)' > "$RUNNER_TEMP/latest-before.txt"
+          if [ "$existing" = "true" ]; then
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          fi
           gh release create "$tag" \
             Output/BlueLampSetup.exe Output/BlueLampSetup.dmg Output/SHA256SUMS.txt \
             --repo "$GITHUB_REPOSITORY" \
-            --latest \
+            --prerelease \
+            --latest=false \
             --title "BlueLampSetup v${BL_VERSION} ($tag)" \
             --notes-file "$notes"
+          echo "BL_PUBLISHED=1" >> "$GITHUB_ENV"
 
       # 「出したつもり」を潰す。GitHub 側に実際に何が載ったかで測る（要件書 S2 の ✅）。
-      - name: 出した release に 3 アセットが載っていることを実測
-        if: env.BL_ASSETS_READY == '1'
+      - name: 出した pre-release に 3 アセットが載り、GA が動いていないことを実測
+        if: env.BL_PUBLISHED == '1'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -415,17 +437,25 @@ jobs:
             exit 1
           fi
           echo "$reason"
-          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name' 2>/dev/null || echo '(none)')
+          before=$(cat "$RUNNER_TEMP/latest-before.txt" 2>/dev/null || echo '(unknown)')
+          pre=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq '.isPrerelease')
           {
-            printf '### GA release の発行結果\n\n| 項目 | 値 |\n|---|---|\n'
+            printf '### pre-release の発行結果（GA は promote-release.yml で昇格させる）\n\n| 項目 | 値 |\n|---|---|\n'
             printf '| タグ | `%s` |\n' "$tag"
             printf '| installer SHA（exe の出所） | `%s` |\n' "$BL_INSTALLER_SHA"
             printf '| dmg の取り込み元 | `%s` |\n' "$BL_MAC_TAG"
             printf '| アセット | %s |\n' "$(printf '%s' "$names" | tr '\n' ' ')"
-            printf '| releases/latest | `%s` |\n' "$latest"
+            printf '| isPrerelease | `%s` |\n' "$pre"
+            printf '| releases/latest（前 → 後・変わってはいけない） | `%s` → `%s` |\n' "$before" "$latest"
+            printf '\n昇格: `gh workflow run promote-release -R %s -f tag=%s`（検証してから）\n' "$GITHUB_REPOSITORY" "$tag"
           } >> "$GITHUB_STEP_SUMMARY"
-          if [ "$latest" != "$tag" ]; then
-            echo "::error::releases/latest が '$latest' で、今出した '$tag' になっていない"
+          if [ "$pre" != "true" ]; then
+            echo "::error::$tag が pre-release になっていない（isPrerelease=$pre）"
+            exit 1
+          fi
+          if [ "$latest" = "$tag" ] || [ "$latest" != "$before" ]; then
+            echo "::error::releases/latest が動いた（'$before' → '$latest'）。このワークフローは GA に触らない"
             exit 1
           fi
 

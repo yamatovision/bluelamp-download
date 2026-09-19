@@ -40,8 +40,9 @@ BlueLamp のセットアップアプリ（Windows: `BlueLampSetup.exe` ／ Mac: 
 
 - ビルド元: `yamatovision/bluelamp-installer`（private）の `main`
 - **Windows**: `.github/workflows/build-release.yml` が windows ランナー＋Inno Setup（`build/build.ps1`）でビルドし、このリポジトリの Release（tag: `build-<sha7>`）として公開します
-  - トリガー: 毎日 06:17 JST の自動検知（main が更新されていれば自動リリース）／手動 `gh workflow run build-release -R yamatovision/bluelamp-download`
-- **Mac**: `.github/workflows/release-macos.yml`（手動 dispatch のみ）が dmg をビルドし、署名・公証・staple して `mac-<sha7>` タグの pre-release として発行します。GA（`releases/latest`）へ載せるのは `build-release.yml` 側で、`.github/scripts/select-mac-release.sh` が載せる dmg を選びます
+  - トリガー: 毎日 06:17 JST（実際の発火は 1.5〜2 時間遅れる）の自動検知で **pre-release**（`build-<sha7>`・Latest にしない）を作る／手動 `gh workflow run build-release -R yamatovision/bluelamp-download`
+  - **GA（`releases/latest`）への昇格は `.github/workflows/promote-release.yml` の dispatch でだけ行う**（検証した sha を `gh workflow run promote-release -R yamatovision/bluelamp-download -f tag=build-<sha7>`）。以前の「GA を止めるための placeholder 前置」は不要（板 #936 系統⑤③）
+- **Mac**: `.github/workflows/release-macos.yml`（手動 dispatch のみ）が dmg をビルドし、署名・公証・staple して `mac-<sha7>` タグの pre-release として発行します。dmg を exe と一緒に `build-<sha7>` の pre-release へ載せるのは `build-release.yml` 側で（`.github/scripts/select-mac-release.sh` が載せる dmg を選ぶ）、GA へは `promote-release.yml` で昇格させます
 - 認証: installer リポの read-only deploy key（Secret `INSTALLER_DEPLOY_KEY`）のみ。ソースコードは公開されません（公開されるのはビルド済みのインストーラと SHA256 のみ）
 
 > 配布物まわりの現在地・既知の罠は `docs/handoff-707-655s2-2026-09-10.md` にまとめてあります。

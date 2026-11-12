@@ -38,8 +38,9 @@ name: release-macos
 #    判定は .github/scripts/release-verdict.sh の bl_verdict_tag_prefix が構造的に弾く。
 #
 # 認証: read-only deploy key（installer リポの閲覧のみ・Secret INSTALLER_DEPLOY_KEY）。PAT 不使用。
-# 署名: Developer ID Application: MIKOTO, K.K. (6X8QVF7RM5)。証明書と Apple ID は GitHub Secret から
-#   環境変数として渡すだけで、**値は読まない・echo しない・ファイルへ平文で書かない**（条件 2）。
+# 署名: Developer ID Application: MIKOTO, K.K. (6X8QVF7RM5)。証明書と公証の API 鍵（p8）は GitHub Secret から
+#   環境変数として渡すだけで、**値は読まない・echo しない**（条件 2）。p8 は installer の build-mac.sh が
+#   mktemp -d の中に 0600 で書き、終わりに消す（notarytool --key がファイルしか受けないため）。
 #   必要な Secret 6 点は installer 側 build/mac/require-signing-secrets.sh が「在るか無いか」だけ検査する。
 
 on:
@@ -118,9 +119,11 @@ jobs:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # 公証は App Store Connect の API 鍵（チーム 6X8QVF7RM5）。鍵 ID と Issuer は公開値で、秘密は p8 だけ。
+          # 2026-11-12（n=4746）に Apple ID＋App 用パスワードが 401 で落ちたので替えた（帳簿 36129 と同じ解き方）。
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          ASC_KEY_ID: JK7AKJ8N6G
+          ASC_ISSUER_ID: 454d472e-7b48-40a6-a8f8-849a59066f61
         run: build/mac/require-signing-secrets.sh
 
       - name: 一時 keychain に Developer ID を取り込む
@@ -175,9 +178,11 @@ jobs:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # 公証は App Store Connect の API 鍵（チーム 6X8QVF7RM5）。鍵 ID と Issuer は公開値で、秘密は p8 だけ。
+          # 2026-11-12（n=4746）に Apple ID＋App 用パスワードが 401 で落ちたので替えた（帳簿 36129 と同じ解き方）。
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          ASC_KEY_ID: JK7AKJ8N6G
+          ASC_ISSUER_ID: 454d472e-7b48-40a6-a8f8-849a59066f61
         run: |
           set -uo pipefail
           status=0

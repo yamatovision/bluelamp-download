@@ -18,6 +18,14 @@ on:
         description: '昇格させる pre-release のタグ（build-<sha7>）。検証済みの物だけを指定する'
         required: true
         type: string
+      runner:
+        # GitHub の作業員が予算の上限で起きないときの逃げ道（n=5048）。bl-ephemeral-win は
+        # 使い捨ての GCP Windows に --ephemeral で 1 job だけ登録した repo runner。
+        # 🔒 当たるのは main からの workflow_dispatch だけ（式は jobs の runs-on）。
+        description: '作業員（github＝GitHub の作業員／bl-ephemeral-win＝使い捨ての自前 Windows）'
+        type: choice
+        options: [github, bl-ephemeral-win]
+        default: github
 
 permissions:
   contents: write
@@ -28,7 +36,7 @@ concurrency:
 
 jobs:
   promote:
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.runner == 'bl-ephemeral-win') && fromJSON('["self-hosted","bl-ephemeral-win"]') || 'ubuntu-latest' }}
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ inputs.tag }}

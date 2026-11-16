@@ -42,6 +42,15 @@ name: build-release
 
 on:
   workflow_dispatch:
+    inputs:
+      runner:
+        # GitHub の作業員が予算の上限で起きないときの逃げ道（n=5048）。bl-ephemeral-win は
+        # 使い捨ての GCP Windows に --ephemeral で 1 job だけ登録した repo runner。
+        # 🔒 当たるのは main からの workflow_dispatch だけ（式は jobs の runs-on）。
+        description: '作業員（github＝GitHub の作業員／bl-ephemeral-win＝使い捨ての自前 Windows）'
+        type: choice
+        options: [github, bl-ephemeral-win]
+        default: github
   schedule:
     - cron: '17 21 * * *'
 
@@ -61,7 +70,7 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.runner == 'bl-ephemeral-win') && fromJSON('["self-hosted","bl-ephemeral-win"]') || 'ubuntu-latest' }}
     outputs:
       # 🚨 sha7 は表示用（タグ名・title）。**同一 commit の判定には使わない**——短縮 SHA の
       #    一致は同一 commit の証明にならない。build の checkout に渡すのは必ず full の sha。
@@ -141,7 +150,7 @@ jobs:
   build:
     needs: check
     if: needs.check.outputs.build_needed == 'true'
-    runs-on: windows-latest
+    runs-on: ${{ (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.runner == 'bl-ephemeral-win') && fromJSON('["self-hosted","bl-ephemeral-win"]') || 'windows-latest' }}
     steps:
       # 🚨 installer を先に root へ、このリポを後から _selfrepo へ。
       #    （root への checkout は作業ディレクトリを掃除するので、順序を入れ替えないこと）

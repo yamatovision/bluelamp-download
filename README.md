@@ -1,6 +1,6 @@
-# BlueLamp ダウンロード
+# ブルーランプ ダウンロード
 
-BlueLamp のセットアップアプリ（Windows: `BlueLampSetup.exe` ／ Mac: `BlueLampSetup.dmg`）の公式ダウンロード置き場です。
+ブルーランプ のセットアップアプリ（Windows: `BlueLampSetup.exe` ／ Mac: `BlueLampSetup.dmg`）の公式ダウンロード置き場です。
 
 ## ダウンロード（常に最新版）
 
@@ -20,7 +20,7 @@ BlueLamp のセットアップアプリ（Windows: `BlueLampSetup.exe` ／ Mac: 
 
 1. 上表の `BlueLampSetup.dmg` をダウンロードします。
 2. ダウンロードした `BlueLampSetup.dmg` をダブルクリックして開きます。
-3. 開いたウィンドウの中の **`BlueLampSetup`（BlueLamp セットアップ）をダブルクリック**します。
+3. 開いたウィンドウの中の **`BlueLampSetup`（ブルーランプ セットアップ）をダブルクリック**します。
    ※ アプリケーションフォルダへのコピーは不要です。セットアップ用のアプリなので、そのまま実行してください。
 4. あとは画面とターミナルの案内どおりに進めれば導入が完了します。
 

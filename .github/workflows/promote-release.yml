@@ -37,6 +37,10 @@ concurrency:
 jobs:
   promote:
     runs-on: ${{ (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.runner == 'bl-ephemeral-win') && fromJSON('["self-hosted","bl-ephemeral-win"]') || 'ubuntu-latest' }}
+    # 自前の Windows 作業員（bl-ephemeral-win）でも ubuntu と同じ bash で走らせる（既定は pwsh になる・n=5048）
+    defaults:
+      run:
+        shell: bash
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ inputs.tag }}

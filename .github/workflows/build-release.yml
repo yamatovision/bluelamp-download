@@ -186,10 +186,6 @@ jobs:
             echo "BL_INSTALLER_SHA7=$sha7"
           } >> "$GITHUB_ENV"
 
-      - name: Build BlueLampSetup.exe (Inno Setup)
-        shell: pwsh
-        run: powershell -ExecutionPolicy Bypass -File build/build.ps1
-
       # ---- ここからコード署名（GlobalSign OV / 秘密鍵は GCP Cloud KMS の HSM 内・外に出ない） ----
       # ⚠️ 署名は必ず SHA256SUMS.txt の生成より前に行う。署名するとファイルのハッシュが変わるため。
       - name: Authenticate to Google Cloud
@@ -212,24 +208,26 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile jsign.jar
           $actual = (Get-FileHash jsign.jar -Algorithm SHA256).Hash
           if ($actual -ne $expected) { throw "jsign.jar checksum mismatch: $actual" }
-      - name: Sign BlueLampSetup.exe (GlobalSign OV / Cloud KMS HSM)
+      # 🔑 署名は ISCC の SignTool として 1 か所で撃つ（n=5048）。外側の exe だけに署名すると、
+      #    実行時に展開される内側の setup.tmp（Setup.e32）が未署名のまま残り、スマートアプリコントロール／
+      #    App Control がそれをエラー 4551 で止める。ISCC は Setup.e32 を埋め込む前と、出来た exe の両方を署名する。
+      # ⚠️ ISCC は「Running Sign Tool command:」に命令を印字する＝トークンは命令に書かず env: で jsign に渡す。
+      - name: Build BlueLampSetup.exe (Inno Setup・内側と外側を GlobalSign OV / Cloud KMS HSM で署名)
         shell: pwsh
         run: |
           $token = gcloud auth print-access-token
           if (-not $token) { throw "failed to obtain GCP access token" }
-          java -jar jsign.jar `
-            --storetype GOOGLECLOUD `
-            --keystore projects/yamatovision-blue-lamp/locations/asia-northeast1/keyRings/bluelamp-codesign `
-            --storepass $token `
-            --alias ov-codesign-2026/cryptoKeyVersions/1 `
-            --certfile _selfrepo/codesign/full-chain.pem `
-            --tsaurl http://timestamp.globalsign.com/tsa/r6advanced1 `
-            --tsmode RFC3161 `
-            --alg SHA-256 `
-            --name "BlueLamp" `
-            --url "https://github.com/yamatovision/bluelamp-download" `
-            Output/BlueLampSetup.exe
-          if ($LASTEXITCODE -ne 0) { throw "jsign failed" }
+          Write-Output "::add-mask::$token"
+          $env:BL_GCP_TOKEN = $token
+          $jar = (Resolve-Path jsign.jar).Path
+          $chain = (Resolve-Path _selfrepo/codesign/full-chain.pem).Path
+          $env:BL_SIGNTOOL = "java -jar `"$jar`" --storetype GOOGLECLOUD" +
+            " --keystore projects/yamatovision-blue-lamp/locations/asia-northeast1/keyRings/bluelamp-codesign" +
+            " --storepass env:BL_GCP_TOKEN --alias ov-codesign-2026/cryptoKeyVersions/1" +
+            " --certfile `"$chain`" --tsaurl http://timestamp.globalsign.com/tsa/r6advanced1 --tsmode RFC3161" +
+            " --alg SHA-256 --name BlueLamp --url https://github.com/yamatovision/bluelamp-download `$f"
+          powershell -ExecutionPolicy Bypass -File build/build.ps1
+          if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
       - name: Verify signature (発行元が株式会社命であること)
         shell: pwsh
         run: |
@@ -239,6 +237,30 @@ jobs:
           if ($sig.SignerCertificate.Subject -notmatch 'MIKOTO') { throw "unexpected signer: $($sig.SignerCertificate.Subject)" }
           if (-not $sig.TimeStamperCertificate) { throw "signature is not timestamped" }
           "| 項目 | 値 |`n|---|---|`n| 署名 | $($sig.Status) |`n| 発行元 | $($sig.SignerCertificate.Subject) |`n| TSA | $($sig.TimeStamperCertificate.Subject) |" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+      # 内側（実行時に %TEMP%\is-*.tmp\BlueLampSetup.tmp として展開される Setup.e32）の署名を現物で測る。
+      # 歓迎の画面で止まる（何も入れない）ので、展開された .tmp を測ったら木ごと止める。
+      - name: Verify inner setup.tmp signature (エラー 4551 の再発防止・n=5048)
+        shell: pwsh
+        run: |
+          $before = @(Get-ChildItem $env:TEMP -Directory -Filter 'is-*.tmp' -ErrorAction SilentlyContinue | ForEach-Object FullName)
+          $p = Start-Process -FilePath Output/BlueLampSetup.exe -PassThru
+          $tmp = $null
+          for ($i = 0; $i -lt 60 -and -not $tmp; $i++) {
+            Start-Sleep -Seconds 1
+            $tmp = Get-ChildItem $env:TEMP -Directory -Filter 'is-*.tmp' -ErrorAction SilentlyContinue |
+              Where-Object { $before -notcontains $_.FullName } |
+              ForEach-Object { Get-ChildItem $_.FullName -Filter '*.tmp' -File -ErrorAction SilentlyContinue } |
+              Where-Object { $_.Length -gt 0 } | Select-Object -First 1
+          }
+          Start-Sleep -Seconds 2
+          $sig = if ($tmp) { Get-AuthenticodeSignature $tmp.FullName } else { $null }
+          taskkill /F /T /PID $p.Id 2>&1 | Out-Null
+          if (-not $tmp) { throw "inner setup .tmp did not appear within 60s" }
+          "inner: $($tmp.Name) status=$($sig.Status) signer=$($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { throw "inner setup.tmp signature status is $($sig.Status)" }
+          if ($sig.SignerCertificate.Subject -notmatch 'MIKOTO') { throw "unexpected inner signer: $($sig.SignerCertificate.Subject)" }
+          if (-not $sig.TimeStamperCertificate) { throw "inner setup.tmp is not timestamped" }
+          "| 内側 setup.tmp | $($sig.Status)（$($sig.SignerCertificate.Subject)） |" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
       # ---- コード署名ここまで ----
 
       # 🚨 dmg はここで **既に署名・公証・staple 済みのもの**を取り込む（要件書 D2-6）。

@@ -71,6 +71,10 @@ concurrency:
 jobs:
   check:
     runs-on: ${{ (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.runner == 'bl-ephemeral-win') && fromJSON('["self-hosted","bl-ephemeral-win"]') || 'ubuntu-latest' }}
+    # 自前の Windows 作業員（bl-ephemeral-win）でも ubuntu と同じ bash で走らせる（既定は pwsh になる・n=5048）
+    defaults:
+      run:
+        shell: bash
     outputs:
       # 🚨 sha7 は表示用（タグ名・title）。**同一 commit の判定には使わない**——短縮 SHA の
       #    一致は同一 commit の証明にならない。build の checkout に渡すのは必ず full の sha。

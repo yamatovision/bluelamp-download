@@ -234,13 +234,16 @@ jobs:
           $env:BL_GCP_TOKEN = $token
           $jar = (Resolve-Path jsign.jar).Path
           $chain = (Resolve-Path _selfrepo/codesign/full-chain.pem).Path
-          # --name は UAC の「プログラム名」に出る表示名＝カタカナ（n=5225）。証明書の主体名・URL・exe の名前は変えない。
-          #   ⚠️ Windows の java 起動器は引数を ANSI の符号頁で読む＝化けたら「?」になる。出た exe の署名の programName を必ず読み戻す
-          $env:BL_SIGNTOOL = "java -jar `"$jar`" --storetype GOOGLECLOUD" +
+          # 署名の表示名（UAC の「プログラム名」）＝カタカナ（n=5225）。証明書の主体名・URL・exe の名前は変えない。
+          #   ⚠️ --name に日本語を引数で渡すと、Windows の java 起動器が ANSI の符号頁で読み「??????」に化ける（build-13dad6c で実測）。
+          #   ⇒ 名前は環境変数 BL_SIGN_NAME で渡し、_selfrepo/codesign/SignWithEnvName.java が jsign に --name として足す。
+          $env:BL_SIGN_NAME = 'ブルーランプ'
+          $wrap = (Resolve-Path _selfrepo/codesign/SignWithEnvName.java).Path
+          $env:BL_SIGNTOOL = "java -cp `"$jar`" `"$wrap`" --storetype GOOGLECLOUD" +
             " --keystore projects/yamatovision-blue-lamp/locations/asia-northeast1/keyRings/bluelamp-codesign" +
             " --storepass env:BL_GCP_TOKEN --alias ov-codesign-2026/cryptoKeyVersions/1" +
             " --certfile `"$chain`" --tsaurl http://timestamp.globalsign.com/tsa/r6advanced1 --tsmode RFC3161" +
-            " --alg SHA-256 --name `"ブルーランプ`" --url https://github.com/yamatovision/bluelamp-download `$f"
+            " --alg SHA-256 --url https://github.com/yamatovision/bluelamp-download `$f"
           powershell -ExecutionPolicy Bypass -File build/build.ps1
           if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
       - name: Verify signature (発行元が株式会社命であること)

@@ -215,7 +215,11 @@ jobs:
           shasum -a 256 BlueLampSetup.dmg > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - name: Upload BlueLampSetup.dmg
+      # dmg の置き場は 1 つ: 本番の撃ちは下の pre-release（mac-<sha7>）だけが持つ（build-release もそこから取る）。
+      # artifact は dry_run（release を作らない）ときの唯一の出力としてだけ残す（n=5426: 本番の撃ちで
+      # 写しを artifact にも上げていたため、口座の artifact の保存枠が埋まった日に release が作れなくなった）。
+      - name: Upload BlueLampSetup.dmg（dry_run のときだけ）
+        if: ${{ inputs.dry_run == true }}
         uses: actions/upload-artifact@v4
         with:
           name: macos-dmg
